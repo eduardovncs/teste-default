@@ -1,0 +1,18 @@
+resources:
+  jobs:
+    main_job:
+      name: main_job
+      tasks:
+        - task_key: create_bronze_table
+          spark_python_task:
+            python_file: ../src/main/main.py
+          environment_key: Default
+      parameters:
+        - name: display_target
+          default: development
+        - name: catalog_name
+          default: labuser9910315_1746292654_1_dev
+      environments:
+        - environment_key: Default
+          spec:
+            client: "2"

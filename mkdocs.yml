@@ -1,0 +1,26 @@
+site_name: Teste
+nav:
+  - Home: index.md
+
+# A saída gerada será na pasta docs na raiz do projeto
+docs_dir: docs  # Isso direciona a saída para a pasta docs na raiz
+site_dir: site
+
+theme:
+  name: "material"
+  language: pt-BR
+  palette:
+    primary: custom
+    scheme: slate
+extra_css:
+  - css/extra.css
+
+plugins:
+  - mkdocstrings:
+      handlers:
+        python:
+          options:
+            separate_signature: true
+            show_signature_annotations: true
+            docstring_style: google
+            docstring_section_style: table

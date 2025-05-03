@@ -1,0 +1,40 @@
+name: Validação do código
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  run-tox:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v3
+
+      - name: Instalando Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalando o Tox
+        run: |
+          python -m pip install --upgrade pip
+          pip install tox==4.25.0
+
+      - name: Verificação da formatação.
+        run: tox -e format
+
+      - name: Verificação da estilo
+        run: tox -e lint
+
+      - name: Verificação de DocStrings.
+        run: tox -e doclint
+
+      - name: Verificação de tipagens.
+        run: tox -e type
+
+      - name: Verificação de testes.
+        run: tox -e test

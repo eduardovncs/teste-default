@@ -1,0 +1,88 @@
+[dependency-groups]
+dev = [
+    "chispa==0.11.1",
+    "pyspark==3.5.4",
+    "pytest==8.3.5"
+]
+
+#
+#   TOX
+#
+
+[tool.tox]
+requires = ["tox==4.25.0"]
+env_list = ["format", "lint", "doclint", "test"]
+
+[tool.tox.env_run_base]
+setenv = { PYTHONPATH = "{toxinidir}" }
+
+[tool.tox.env.doclint]
+description = "Verifica docstrings com pydoclint"
+skip_install = true
+deps = ["pydoclint==0.6.5"]
+commands = [["pydoclint", "."]]
+
+[tool.tox.env.format]
+description = "Lint com ruff"
+skip_install = true
+deps = ["ruff==0.11.8"]
+commands = [["ruff", "format", "--check"]]
+
+[tool.tox.env.lint]
+description = "Executa pydoclint e ruff"
+skip_install = true
+deps = ["ruff==0.11.8"]
+commands = [["ruff", "check"]]
+
+[tool.tox.env.type]
+description = "Verifica se os tipos do código estão corretos"
+skip_install = true
+commands = [["pyright", "."]]
+deps = ["pyright==1.1.400"]
+dependency_groups = ["dev"]
+
+[tool.tox.env.test]
+description = "Executa os testes automáticos"
+skip_install = true
+commands =[["pytest", "tests/"]]
+dependency_groups = ["dev"]
+
+#
+#   RUFF
+#
+
+[tool.ruff]
+line-length = 70
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = ["INP001", "D100","D212", "COM812"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+#
+#   PYDOCLINT
+#
+
+[tool.pydoclint]
+style = "google"
+check-yields = true
+check-return-types = false
+arg-type-hints-in-docstring = false
+skip-checking-short-docstrings = false
+allow-init-docstring = true
+check-style-mismatch = true
+
+#
+#   PYRIGHT
+#
+
+[tool.pyright]
+typeCheckingMode = "basic"
+target-version = "py312"
+include = ["app", "tests"]
+reportAttributeAccessIssue = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
