@@ -1,0 +1,6 @@
+# Dependências obrigatórias do spark-lineage
+# Nota: O databricks-connect já inclui o pyspark e o delta.tables compatíveis com o Databricks Runtime.
+# Não inclua 'delta-spark' ou 'pyspark' avulsos aqui, pois o delta-spark puxa o pyspark aberto e gera conflito.
+databricks-connect>=16.1.0,<17.0.0
+databricks-sdk>=0.20.0
+pandas>=1.5.0

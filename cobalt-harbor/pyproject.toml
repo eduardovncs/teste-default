@@ -1,0 +1,154 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spark-lineage"
+version = "0.1.0"
+description = "CLI para captura de planos de execução Spark e mapeamento de fontes, destinos e colunas."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "databricks-connect>=16.1.0,<17.0.0",
+    "databricks-sdk>=0.20.0",
+    "pandas>=1.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "ruff>=0.8.0",
+    "ty>=0.0.1a1",
+    "pydoclint>=0.5.0",
+    "xenon>=0.9.0",
+    "poethepoet>=0.29.0",
+]
+
+[project.scripts]
+spark-lineage = "spark_lineage.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# --------------------------------------------------------------------------- #
+# pytest
+# --------------------------------------------------------------------------- #
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+filterwarnings = [
+    "ignore:distutils Version classes are deprecated:DeprecationWarning",
+]
+
+# --------------------------------------------------------------------------- #
+# Ruff (lint + format)
+# --------------------------------------------------------------------------- #
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+src = ["src", "tests"]
+extend-exclude = ["*.egg-info"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+docstring-code-format = true
+
+[tool.ruff.lint]
+select = [
+    "E", "W",   # pycodestyle
+    "F",        # pyflakes
+    "I",        # isort
+    "N",        # pep8-naming
+    "UP",       # pyupgrade
+    "B",        # flake8-bugbear
+    "A",        # flake8-builtins
+    "C4",       # flake8-comprehensions
+    "C90",      # mccabe (complexidade ciclomática, alinhado ao xenon)
+    "SIM",      # flake8-simplify
+    "RET",      # flake8-return
+    "PIE",      # flake8-pie
+    "PERF",     # perflint
+    "PL",       # pylint
+    "RUF",      # regras próprias do ruff
+    "D",        # pydocstyle
+    "BLE",      # blind except
+    "S",        # bandit (segurança)
+]
+ignore = [
+    "D203",     # conflita com D211
+    "D213",     # conflita com D212
+    "PLC0415",  # imports tardios são intencionais (pyspark/databricks são opcionais em tempo de import)
+    "PLR2004",  # valores mágicos em comparações
+    "S102",     # exec é o mecanismo central da captura (código instrumentado do próprio projeto)
+    "S110",     # try/except/pass em limpezas de melhor esforço
+    "RUF001", "RUF002", "RUF003",  # caracteres unicode ambíguos em textos em português
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "D", "PLR0915", "S102"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.pylint]
+max-args = 6
+max-branches = 12
+max-returns = 6
+max-statements = 50
+
+# --------------------------------------------------------------------------- #
+# ty (type checker)
+# --------------------------------------------------------------------------- #
+[tool.ty.environment]
+python-version = "3.12"
+root = ["./src"]
+
+[tool.ty.src]
+include = ["src", "tests"]
+
+[tool.ty.rules]
+possibly-unresolved-reference = "error"
+
+# --------------------------------------------------------------------------- #
+# pydoclint (consistência docstring x assinatura)
+# --------------------------------------------------------------------------- #
+[tool.pydoclint]
+style = "google"
+exclude = "\\.git|\\.venv|tests"
+arg-type-hints-in-docstring = false
+arg-type-hints-in-signature = true
+check-return-types = false
+check-yield-types = false
+skip-checking-short-docstrings = false
+skip-checking-raises = false
+allow-init-docstring = true
+check-class-attributes = false
+should-document-private-class-methods = false
+
+# --------------------------------------------------------------------------- #
+# xenon (limites de complexidade - radon). O xenon não lê pyproject diretamente,
+# então os limites ficam aqui e são aplicados pela task `poe complexity`.
+# --------------------------------------------------------------------------- #
+[tool.xenon]
+max-absolute = "B"
+max-modules = "A"
+max-average = "A"
+
+# --------------------------------------------------------------------------- #
+# Tasks (poethepoet): `poe check` roda toda a esteira de qualidade
+# --------------------------------------------------------------------------- #
+[tool.poe.tasks]
+format = "python -m ruff format src tests"
+format-check = "python -m ruff format --check src tests"
+lint = "python -m ruff check src tests"
+lint-fix = "python -m ruff check --fix src tests"
+typecheck = "python -m ty check"
+docstrings = "python -m pydoclint.main src"
+complexity = "python -m xenon --max-absolute B --max-modules A --max-average A src"
+test = "python -m pytest -q"
+fix = ["format", "lint-fix"]
+check = ["format-check", "lint", "typecheck", "docstrings", "complexity", "test"]
