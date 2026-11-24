@@ -24,9 +24,10 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from .compact import compact_plan, render_compact_markdown
 from .doctor import render_doctor_text, run_doctor
 from .impact import render_impact_markdown, trace_column_impact
-from .sources import VALID_TAGS, build_sources, discover_plan_tables, extract_tag, render_markdown
+from .sources import VALID_TAGS, build_sources, discover_doc_tables, discover_plan_tables, extract_tag, render_markdown
 
 Json = dict[str, Any]
 
@@ -83,19 +84,36 @@ def cmd_sources(ns: argparse.Namespace) -> int:
     result = json.loads(Path(ns.plans).read_text(encoding="utf-8"))
     catalog = result.get("catalog")
     if ns.catalog:
-        tables = discover_plan_tables(result.get("plans", []))
+        tables = discover_doc_tables(result)
         catalog = fetch_catalog_schema(tables)
         result = {**result, "catalog": catalog}
     doc = build_sources(result, catalog=catalog)
     payload = extract_tag(result, doc, tag=ns.tag, table=ns.table)
 
-    if ns.format == "md" and ns.tag not in ("catalog", "plans"):
+    if ns.format == "md" and ns.tag not in ("catalog", "plans", "column_lineage"):
         view_doc = payload if ns.tag == "all" else {**doc, ns.tag: payload}
         out_text = render_markdown(view_doc, tag=ns.tag)
     else:
         out_text = json.dumps(payload, indent=2, ensure_ascii=False) + "\n"
 
     _write_optional_output(ns.output, payload, out_text, f"{ns.cmd} (tag={ns.tag})")
+    sys.stdout.write(out_text)
+    return 0
+
+
+def cmd_compact(ns: argparse.Namespace) -> int:
+    """Executa o subcomando ``compact`` para compactar/filtrar/renderizar um artefato do job."""
+    result = json.loads(Path(ns.plans).read_text(encoding="utf-8"))
+    tables = [t.strip() for t in (ns.table or []) if t.strip()] or None
+    columns: list[str] | None = None
+    if ns.columns:
+        columns = [c.strip() for raw in ns.columns for c in raw.split(",") if c.strip()] or None
+    compact_doc = compact_plan(result, max_hops=ns.max_hops, tables=tables, columns=columns)
+    if ns.format == "md":
+        out_text = render_compact_markdown(compact_doc)
+    else:
+        out_text = json.dumps(compact_doc, indent=2, ensure_ascii=False, default=str) + "\n"
+    _write_optional_output(ns.output, compact_doc, out_text, "compact")
     sys.stdout.write(out_text)
     return 0
 
@@ -185,7 +203,7 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_query_args(sp_query, default_format="json")
 
     sp_imp = sub.add_parser("impact", help="rastreia filtros, joins, transformações e destinos de uma coluna")
-    sp_imp.add_argument("--plans", default="plan.json", help="arquivo único gerado pelo capture (padrão: plan.json)")
+    sp_imp.add_argument("--plans", default="plan.json", help="arquivo gerado pelo capture (compactado ou bruto)")
     sp_imp.add_argument("--table", required=True, help="nome completo ou sufixo da tabela de origem")
     sp_imp.add_argument("--column", required=True, help="nome da coluna a rastrear")
     sp_imp.add_argument(
@@ -196,6 +214,32 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_imp.add_argument("--format", choices=["json", "md"], default="json", help="formato no stdout (padrão: json)")
     sp_imp.add_argument("--output", default=None, help="opcional: grava a saída em arquivo")
+
+    sp_cmp = sub.add_parser(
+        "compact",
+        help="compacta um plan.json bruto (ou filtra/renderiza um compactado) com fontes, queries e linhagem por coluna",
+    )
+    sp_cmp.add_argument("--plans", default="plan.json", help="arquivo plan.json (bruto ou já compactado)")
+    sp_cmp.add_argument(
+        "--table",
+        action="append",
+        default=[],
+        help="filtra por tabela ou sufixo (repetível)",
+    )
+    sp_cmp.add_argument(
+        "--columns",
+        action="append",
+        default=[],
+        help="filtra colunas em column_lineage (separadas por vírgula ou repetível)",
+    )
+    sp_cmp.add_argument(
+        "--max-hops",
+        type=int,
+        default=5,
+        help="máximo de saltos multi-hop por coluna (padrão: 5)",
+    )
+    sp_cmp.add_argument("--format", choices=["json", "md"], default="json", help="formato no stdout (padrão: json)")
+    sp_cmp.add_argument("--output", default=None, help="opcional: grava a saída em arquivo")
 
     sp_doc = sub.add_parser("doctor", help="verifica bibliotecas instaladas, configuração Databricks e sessão Spark")
     sp_doc.add_argument(
@@ -232,6 +276,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor(ns)
     if ns.cmd == "impact":
         return cmd_impact(ns)
+    if ns.cmd == "compact":
+        return cmd_compact(ns)
     return cmd_sources(ns)
 
 

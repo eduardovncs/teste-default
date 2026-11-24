@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import ast
 import builtins
+import concurrent.futures
 import contextlib
 import datetime as dt
 import hashlib
@@ -44,6 +45,7 @@ import json
 import os
 import re
 import sys
+import threading
 import tokenize
 import traceback
 from collections.abc import Callable, Iterator
@@ -189,8 +191,36 @@ class _JobExit(Exception):  # noqa: N818 - sinal de controle de fluxo (como Syst
 
 class _Widgets:
     def __init__(self, params: dict[str, str]) -> None:
-        self._p = dict(params)
-        self._defaults: dict[str, str] = {}
+        self._base_params = dict(params)
+        self._tls = threading.local()
+
+    @property
+    def _p(self) -> dict[str, str]:
+        p = getattr(self._tls, "p", None)
+        if p is None:
+            p = dict(self._base_params)
+            self._tls.p = p
+        return p
+
+    @_p.setter
+    def _p(self, value: dict[str, str]) -> None:
+        self._tls.p = value
+
+    @property
+    def _defaults(self) -> dict[str, str]:
+        d = getattr(self._tls, "defaults", None)
+        if d is None:
+            d = {}
+            self._tls.defaults = d
+        return d
+
+    @_defaults.setter
+    def _defaults(self, value: dict[str, str]) -> None:
+        self._tls.defaults = value
+
+    def reset_thread_state(self, params: dict[str, str]) -> None:
+        self._tls.p = dict(params)
+        self._tls.defaults = {}
 
     def text(self, name: str, defaultValue: str = "", label: str | None = None) -> None:  # noqa: N803
         _ = label
@@ -1063,17 +1093,269 @@ def _has_udf_decorator(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
     return any("udf" in ast.unparse(dec).lower() for dec in node.decorator_list)
 
 
+_SPARK_HINT_PARAM_NAMES = frozenset(
+    {"spark", "sc", "df", "dataframe", "batch_df", "dbutils", "sqlcontext", "delta_table", "session"}
+)
+_SPARK_HINT_TYPE_TOKENS = ("dataframe", "sparksession", "column", "deltatable", "catalog")
+_SPARK_DISQUALIFY_NAMES = frozenset(
+    {
+        "spark",
+        "sc",
+        "sqlContext",
+        "dbutils",
+        "DeltaTable",
+        "SparkSession",
+        "__spark_lineage_sql__",
+        "__spark_lineage_run__",
+        "__spark_lineage_magic__",
+    }
+)
+_SAFE_SINK_DECORATORS = frozenset({"staticmethod", "classmethod"})
+_SAFE_SINK_BUILTINS = frozenset(
+    {
+        "print",
+        "len",
+        "str",
+        "repr",
+        "int",
+        "float",
+        "bool",
+        "type",
+        "isinstance",
+        "issubclass",
+        "format",
+        "round",
+        "min",
+        "max",
+        "sum",
+        "sorted",
+        "enumerate",
+        "zip",
+        "range",
+        "list",
+        "dict",
+        "set",
+        "tuple",
+        "abs",
+        "any",
+        "all",
+        "chr",
+        "ord",
+        "id",
+        "hasattr",
+        "getattr",
+        "pprint",
+    }
+)
+_SAFE_LOG_METHODS = frozenset(
+    {
+        "debug",
+        "info",
+        "warning",
+        "warn",
+        "error",
+        "critical",
+        "exception",
+        "fatal",
+        "log",
+        "flush",
+        "pprint",
+        "pformat",
+        "format_exc",
+        "print_exc",
+        "getLogger",
+        "basicConfig",
+        "isEnabledFor",
+        "setLevel",
+    }
+)
+_SAFE_PURE_METHODS = frozenset(
+    {
+        "format",
+        "join",
+        "strip",
+        "lstrip",
+        "rstrip",
+        "lower",
+        "upper",
+        "title",
+        "capitalize",
+        "replace",
+        "split",
+        "rsplit",
+        "splitlines",
+        "startswith",
+        "endswith",
+        "encode",
+        "decode",
+        "ljust",
+        "rjust",
+        "center",
+        "zfill",
+        "find",
+        "rfind",
+        "index",
+        "isoformat",
+        "strftime",
+        "keys",
+        "values",
+        "items",
+        "get",
+        "copy",
+    }
+)
+_SAFE_MODULE_METHODS: dict[str, frozenset[str]] = {
+    "datetime": frozenset({"now", "utcnow", "today", "fromtimestamp", "strftime", "isoformat"}),
+    "time": frozenset({"time", "monotonic", "perf_counter", "strftime", "localtime", "gmtime"}),
+    "json": frozenset({"dumps"}),
+    "os": frozenset({"getenv"}),
+    "environ": frozenset({"get"}),
+}
+
+
+def _dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _dotted_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return ""
+
+
+def _is_safe_assign_target(target: ast.AST) -> bool:
+    if isinstance(target, ast.Name):
+        return True
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return all(_is_safe_assign_target(elt) for elt in target.elts)
+    return False
+
+
+def _is_logger_receiver(recv: ast.AST) -> bool:
+    dotted = _dotted_name(recv).lower()
+    if dotted in ("logging", "warnings", "pprint", "traceback", "sys.stdout", "sys.stderr", "stdout", "stderr"):
+        return True
+    if isinstance(recv, ast.Call):
+        return _dotted_name(recv.func).lower() == "logging.getlogger"
+    tail = dotted.rsplit(".", 1)[-1] if dotted else ""
+    return bool(tail) and ("log" in tail or tail in ("console", "stdout", "stderr"))
+
+
+def _is_safe_sink_call(call: ast.Call, safe_local_sinks: set[str]) -> bool:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id in _SAFE_SINK_BUILTINS or func.id in safe_local_sinks
+    if isinstance(func, ast.Attribute):
+        method = func.attr
+        recv_dotted = _dotted_name(func.value).lower()
+        recv_tail = recv_dotted.rsplit(".", 1)[-1] if recv_dotted else ""
+        if method == "write":
+            return recv_dotted in ("sys.stdout", "sys.stderr", "stdout", "stderr")
+        if method in _SAFE_LOG_METHODS and _is_logger_receiver(func.value):
+            return True
+        if method in _SAFE_PURE_METHODS:
+            return True
+        if recv_tail in _SAFE_MODULE_METHODS and method in _SAFE_MODULE_METHODS[recv_tail]:
+            return True
+        return False
+    return False
+
+
+def _has_spark_param_or_annotation(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+    args = fn.args
+    all_args = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+    if args.vararg:
+        all_args.append(args.vararg)
+    if args.kwarg:
+        all_args.append(args.kwarg)
+    for a in all_args:
+        if a.arg.lower() in _SPARK_HINT_PARAM_NAMES:
+            return True
+        if a.annotation is not None:
+            ann = ast.unparse(a.annotation).lower()
+            if any(tok in ann for tok in _SPARK_HINT_TYPE_TOKENS):
+                return True
+    return False
+
+
+def _is_non_spark_sink_function(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    safe_local_sinks: set[str] | None = None,
+) -> bool:
+    """Retorna ``True`` se ``fn`` for uma função sink pura (sem retorno com valor, sem mutação externa e sem Spark)."""
+    local_sinks = safe_local_sinks or set()
+    for dec in fn.decorator_list:
+        if _dotted_name(dec) not in _SAFE_SINK_DECORATORS:
+            return False
+    if _has_spark_param_or_annotation(fn):
+        return False
+
+    for stmt in fn.body:
+        for child in ast.walk(stmt):
+            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Yield, ast.YieldFrom)):
+                return False
+            if isinstance(child, (ast.Global, ast.Nonlocal)):
+                return False
+            if isinstance(child, ast.Return) and child.value is not None:
+                return False
+            if isinstance(child, ast.Import):
+                if any(a.name.split(".")[0] in ("pyspark", "delta") for a in child.names):
+                    return False
+            elif isinstance(child, ast.ImportFrom):
+                if (child.module or "").split(".")[0] in ("pyspark", "delta"):
+                    return False
+            elif isinstance(child, ast.Assign):
+                if not all(_is_safe_assign_target(t) for t in child.targets):
+                    return False
+            elif isinstance(child, (ast.AnnAssign, ast.AugAssign)):
+                if not _is_safe_assign_target(child.target):
+                    return False
+            elif isinstance(child, ast.Delete):
+                if not all(_is_safe_assign_target(t) for t in child.targets):
+                    return False
+            elif isinstance(child, ast.Name):
+                if child.id in _SPARK_DISQUALIFY_NAMES:
+                    return False
+            elif isinstance(child, ast.Call):
+                if not _is_safe_sink_call(child, local_sinks):
+                    return False
+    return True
+
+
+def _collect_sink_functions(module: ast.Module) -> set[str]:
+    """Identifica funções sink no módulo (incluindo sinks que chamam outros sinks do mesmo módulo)."""
+    top_funcs = [n for n in module.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    sinks: set[str] = set()
+    changed = True
+    while changed:
+        changed = False
+        for fn in top_funcs:
+            if fn.name not in sinks and _is_non_spark_sink_function(fn, sinks):
+                sinks.add(fn.name)
+                changed = True
+    return sinks
+
+
 class _BranchTransformer(ast.NodeTransformer):
     # Envolve condições de `if` de negócio com `__spark_lineage_branch__(site, cond_str, expr)`.
 
     def __init__(self, rel_file: str) -> None:
         self.rel_file = rel_file
+        self._safe_local_sinks: set[str] = set()
+
+    def visit_Module(self, node: ast.Module) -> ast.Module:
+        self._safe_local_sinks = _collect_sink_functions(node)
+        self.generic_visit(node)
+        return node
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
-        return node if _has_udf_decorator(node) else self.generic_visit(node)
+        if _has_udf_decorator(node) or _is_non_spark_sink_function(node, self._safe_local_sinks):
+            return node
+        return self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
-        return node if _has_udf_decorator(node) else self.generic_visit(node)
+        if _has_udf_decorator(node) or _is_non_spark_sink_function(node, self._safe_local_sinks):
+            return node
+        return self.generic_visit(node)
 
     def visit_If(self, node: ast.If) -> ast.If:
         self.generic_visit(node)
@@ -1142,23 +1424,29 @@ class _BranchMetaPathFinder(importlib.abc.MetaPathFinder):
         self.root_prefix = root_prefix
         self.tool_file = tool_file
         self._code_cache: dict[str, CodeType] = {}
-        self._in_find = False
+        self._lock = threading.Lock()
+        self._tls = threading.local()
 
     def compile_file(self, filepath: str) -> CodeType:
         abspath = os.path.abspath(filepath)
-        if abspath not in self._code_cache:
-            try:
-                with tokenize.open(abspath) as f:
-                    raw_src = f.read()
-            except Exception:  # noqa: BLE001
-                raw_src = Path(abspath).read_text(encoding="utf-8")
-            src = preprocess_notebook_source(raw_src, abspath)
-            rel = os.path.relpath(abspath, self.root)
-            tree = ast.parse(src, filename=abspath)
-            tree = _BranchTransformer(rel).visit(tree)
-            ast.fix_missing_locations(tree)
-            self._code_cache[abspath] = compile(tree, filename=abspath, mode="exec")
-        return self._code_cache[abspath]
+        with self._lock:
+            cached = self._code_cache.get(abspath)
+        if cached is not None:
+            return cached
+        try:
+            with tokenize.open(abspath) as f:
+                raw_src = f.read()
+        except Exception:  # noqa: BLE001
+            raw_src = Path(abspath).read_text(encoding="utf-8")
+        src = preprocess_notebook_source(raw_src, abspath)
+        rel = os.path.relpath(abspath, self.root)
+        tree = ast.parse(src, filename=abspath)
+        tree = _BranchTransformer(rel).visit(tree)
+        ast.fix_missing_locations(tree)
+        compiled = compile(tree, filename=abspath, mode="exec")
+        with self._lock:
+            self._code_cache[abspath] = compiled
+        return compiled
 
     def find_spec(
         self,
@@ -1166,13 +1454,13 @@ class _BranchMetaPathFinder(importlib.abc.MetaPathFinder):
         path: Any,
         target: ModuleType | None = None,
     ) -> importlib.machinery.ModuleSpec | None:
-        if self._in_find:
+        if getattr(self._tls, "in_find", False):
             return None
-        self._in_find = True
+        self._tls.in_find = True
         try:
             spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
         finally:
-            self._in_find = False
+            self._tls.in_find = False
         if spec is None or not spec.origin or not spec.origin.endswith(".py"):
             return spec
         origin = os.path.abspath(spec.origin)
@@ -1187,7 +1475,7 @@ class _BranchMetaPathFinder(importlib.abc.MetaPathFinder):
 
 
 class BranchExplorer:
-    """Rastreia decisões ``if/else`` executadas e agenda passadas extras para ramos não visitados."""
+    """Rastreia decisões ``if/else`` executadas e agenda passadas extras (inclusive em paralelo) para ramos não visitados."""
 
     def __init__(self, enabled: bool = True) -> None:
         """Inicializa o explorador de ramos.
@@ -1198,14 +1486,74 @@ class BranchExplorer:
         self.enabled = enabled
         self.branches: dict[str, Json] = {}
         self.order: list[str] = []
-        self.pass_index: int = 0
-        self.target_site: str | None = None
-        self.target_value: bool | None = None
-        self.planned_forces: dict[str, bool] = {}
-        self.has_flipped: bool = True
-        self.active_branch_label: str | None = None
-        self._current_forces_taken: dict[str, bool] = {}
-        self._forced_this_pass: set[str] = set()
+        self._scheduled: set[tuple[str, bool]] = set()
+        self._lock = threading.RLock()
+        self._tls = threading.local()
+        self.start_pass(0)
+
+    def _state(self) -> Json:
+        st = getattr(self._tls, "state", None)
+        if st is None:
+            st = {
+                "pass_index": 0,
+                "target_site": None,
+                "target_value": None,
+                "planned_forces": {},
+                "has_flipped": True,
+                "active_branch_label": None,
+                "current_forces_taken": {},
+                "forced_this_pass": set(),
+            }
+            self._tls.state = st
+        return st
+
+    @property
+    def pass_index(self) -> int:
+        return self._state()["pass_index"]
+
+    @pass_index.setter
+    def pass_index(self, val: int) -> None:
+        self._state()["pass_index"] = val
+
+    @property
+    def target_site(self) -> str | None:
+        return self._state()["target_site"]
+
+    @target_site.setter
+    def target_site(self, val: str | None) -> None:
+        self._state()["target_site"] = val
+
+    @property
+    def target_value(self) -> bool | None:
+        return self._state()["target_value"]
+
+    @target_value.setter
+    def target_value(self, val: bool | None) -> None:
+        self._state()["target_value"] = val
+
+    @property
+    def planned_forces(self) -> dict[str, bool]:
+        return self._state()["planned_forces"]
+
+    @planned_forces.setter
+    def planned_forces(self, val: dict[str, bool]) -> None:
+        self._state()["planned_forces"] = val
+
+    @property
+    def has_flipped(self) -> bool:
+        return self._state()["has_flipped"]
+
+    @has_flipped.setter
+    def has_flipped(self, val: bool) -> None:
+        self._state()["has_flipped"] = val
+
+    @property
+    def active_branch_label(self) -> str | None:
+        return self._state()["active_branch_label"]
+
+    @active_branch_label.setter
+    def active_branch_label(self, val: str | None) -> None:
+        self._state()["active_branch_label"] = val
 
     def start_pass(
         self,
@@ -1214,7 +1562,7 @@ class BranchExplorer:
         target_value: bool | None = None,
         planned_forces: dict[str, bool] | None = None,
     ) -> None:
-        """Inicia uma nova passada de execução do job.
+        """Inicia uma nova passada de execução do job (estado isolado na thread atual).
 
         Args:
             pass_index: Índice da passada (0 para a execução natural).
@@ -1222,24 +1570,26 @@ class BranchExplorer:
             target_value: Valor booleano forçado no ``target_site``.
             planned_forces: Mapa completo de decisões forçadas para alcançar o ``target_site``.
         """
-        self.pass_index = pass_index
-        self.target_site = target_site
-        self.target_value = target_value
-        self.planned_forces = dict(planned_forces or {})
-        self.has_flipped = pass_index == 0
-        self.active_branch_label = None
-        self._current_forces_taken = {}
-        self._forced_this_pass = set()
+        self._tls.state = {
+            "pass_index": pass_index,
+            "target_site": target_site,
+            "target_value": target_value,
+            "planned_forces": dict(planned_forces or {}),
+            "has_flipped": pass_index == 0,
+            "active_branch_label": None,
+            "current_forces_taken": {},
+            "forced_this_pass": set(),
+        }
 
-    def _ensure_branch(self, site_id: str, cond_str: str, actual: bool) -> Json:
+    def _ensure_branch(self, site_id: str, cond_str: str, actual: bool, st: Json) -> Json:
         info = self.branches.get(site_id)
         if info is None:
             info = {
                 "site": site_id,
                 "condition": cond_str,
-                "natural_value": actual if self.pass_index == 0 else None,
+                "natural_value": actual if st["pass_index"] == 0 else None,
                 "visited": set(),
-                "required_forces": dict(self._current_forces_taken),
+                "required_forces": dict(st["current_forces_taken"]),
                 "status_by_value": {},
             }
             self.branches[site_id] = info
@@ -1260,19 +1610,21 @@ class BranchExplorer:
         actual = bool(value)
         if not self.enabled:
             return actual
-        info = self._ensure_branch(site_id, cond_str, actual)
-        if site_id in self.planned_forces and site_id not in self._forced_this_pass:
-            self._forced_this_pass.add(site_id)
-            chosen = self.planned_forces[site_id]
-            self._current_forces_taken[site_id] = chosen
-            info["visited"].add(chosen)
-            if site_id == self.target_site and not self.has_flipped:
-                self.has_flipped = True
-                self.active_branch_label = f"{site_id} ({cond_str} -> {chosen})"
-            return chosen
-        info["visited"].add(actual)
-        info["status_by_value"].setdefault(str(actual), "ok")
-        return actual
+        st = self._state()
+        with self._lock:
+            info = self._ensure_branch(site_id, cond_str, actual, st)
+            if site_id in st["planned_forces"] and site_id not in st["forced_this_pass"]:
+                st["forced_this_pass"].add(site_id)
+                chosen = st["planned_forces"][site_id]
+                st["current_forces_taken"][site_id] = chosen
+                info["visited"].add(chosen)
+                if site_id == st["target_site"] and not st["has_flipped"]:
+                    st["has_flipped"] = True
+                    st["active_branch_label"] = f"{site_id} ({cond_str} -> {chosen})"
+                return chosen
+            info["visited"].add(actual)
+            info["status_by_value"].setdefault(str(actual), "ok")
+            return actual
 
     def mark_target_status(self, status_msg: str) -> None:
         """Registra o status final do ramo forçado na passada atual.
@@ -1280,11 +1632,15 @@ class BranchExplorer:
         Args:
             status_msg: Mensagem de status (ex.: ``"ok"`` ou descrição de erro).
         """
-        if self.target_site and self.target_site in self.branches:
-            info = self.branches[self.target_site]
-            if self.target_value is not None:
-                info["visited"].add(self.target_value)
-            info["status_by_value"][str(self.target_value)] = status_msg
+        st = self._state()
+        target_site = st["target_site"]
+        target_value = st["target_value"]
+        with self._lock:
+            if target_site and target_site in self.branches:
+                info = self.branches[target_site]
+                if target_value is not None:
+                    info["visited"].add(target_value)
+                info["status_by_value"][str(target_value)] = status_msg
 
     def next_unvisited(self) -> tuple[str, bool, str, dict[str, bool]] | None:
         """Retorna o próximo ramo ainda não visitado, ou ``None`` se todos foram explorados.
@@ -1292,13 +1648,31 @@ class BranchExplorer:
         Returns:
             Tupla ``(site_id, valor_forçado, condição, forces_necessários)`` ou ``None``.
         """
-        for site_id in self.order:
-            info = self.branches[site_id]
-            for candidate in (True, False):
-                if candidate not in info["visited"]:
-                    forces = {**info["required_forces"], site_id: candidate}
-                    return site_id, candidate, info["condition"], forces
-        return None
+        with self._lock:
+            for site_id in self.order:
+                info = self.branches[site_id]
+                for candidate in (True, False):
+                    if candidate not in info["visited"] and (site_id, candidate) not in self._scheduled:
+                        forces = {**info["required_forces"], site_id: candidate}
+                        return site_id, candidate, info["condition"], forces
+            return None
+
+    def next_unvisited_batch(self, max_items: int) -> list[tuple[str, bool, str, dict[str, bool]]]:
+        """Reserva atomicamente até ``max_items`` ramos ainda não visitados para execução paralela."""
+        if max_items <= 0:
+            return []
+        batch: list[tuple[str, bool, str, dict[str, bool]]] = []
+        with self._lock:
+            for site_id in self.order:
+                info = self.branches[site_id]
+                for candidate in (True, False):
+                    if candidate not in info["visited"] and (site_id, candidate) not in self._scheduled:
+                        self._scheduled.add((site_id, candidate))
+                        forces = {**info["required_forces"], site_id: candidate}
+                        batch.append((site_id, candidate, info["condition"], forces))
+                        if len(batch) >= max_items:
+                            return batch
+        return batch
 
     def summary(self) -> list[Json]:
         """Gera o resumo dos ramos descobertos e explorados.
@@ -1412,10 +1786,36 @@ class Capturer:
         self.warnings: list[Json] = []
         self.read_sites: dict[str, list[str]] = {}
         self._tool_file = os.path.abspath(__file__)
+        self._lock = threading.RLock()
+        self._tls = threading.local()
         self._row_cache: dict[tuple[Any, ...], list[Any]] = {}
         self._pandas_cache: dict[tuple[Any, ...], Any] = {}
-        self.written_tables: dict[str, Any] = {}
         self._table_exists_cache: dict[str, bool] = {}
+        self._ast_cache: dict[str, ast.Module | None] = {}
+
+    @property
+    def written_tables(self) -> dict[str, Any]:
+        wt = getattr(self._tls, "written_tables", None)
+        if wt is None:
+            wt = {}
+            self._tls.written_tables = wt
+        return wt
+
+    @written_tables.setter
+    def written_tables(self, value: dict[str, Any]) -> None:
+        self._tls.written_tables = value
+
+    @property
+    def written_paths(self) -> dict[str, Any]:
+        wp = getattr(self._tls, "written_paths", None)
+        if wp is None:
+            wp = {}
+            self._tls.written_paths = wp
+        return wp
+
+    @written_paths.setter
+    def written_paths(self, value: dict[str, Any]) -> None:
+        self._tls.written_paths = value
 
     def record_written_table(self, table: str | None, df: Any) -> None:
         """Registra uma tabela gravada (interceptada) para que ``tableExists`` e ``spark.table`` a enxerguem."""
@@ -1426,6 +1826,23 @@ class Capturer:
     def get_written_table(self, table: str | None) -> Any | None:
         norm = _normalize_target(table)
         return self.written_tables.get(norm.lower()) if norm else None
+
+    @staticmethod
+    def _norm_path(path: str | None) -> str | None:
+        if not isinstance(path, str):
+            return None
+        cleaned = path.strip().rstrip("/\\")
+        return cleaned.lower() if cleaned else None
+
+    def record_written_path(self, path: str | None, df: Any) -> None:
+        """Registra um caminho de arquivo gravado (interceptado) para re-leituras posteriores no mesmo job."""
+        key = self._norm_path(path)
+        if key and df is not None:
+            self.written_paths[key] = df
+
+    def get_written_path(self, path: str | None) -> Any | None:
+        key = self._norm_path(path)
+        return self.written_paths.get(key) if key else None
 
     def call_site(self) -> Json | None:
         """Localiza onde no código do projeto a action atual foi chamada.
@@ -1498,17 +1915,20 @@ class Capturer:
             df = _as_dataframe(df, owner)
             sections = split_sections(explain_text(df))
         except Exception as exc:  # noqa: BLE001
-            self.warnings.append(
-                {
-                    "action": action,
-                    "call_site": site,
-                    "message": f"falha ao obter o plano ({type(df).__name__}): {exc!r}",
-                }
-            )
+            with self._lock:
+                self.warnings.append(
+                    {
+                        "action": action,
+                        "call_site": site,
+                        "message": f"falha ao obter o plano ({type(df).__name__}): {exc!r}",
+                    }
+                )
             return
         # Para planos novos, captura também `mode='formatted'` para evitar truncamento no Serverless.
         base = sections.get("analyzed") or sections.get("raw") or ""
-        if _plan_hash(base) not in self.plans:
+        with self._lock:
+            is_new = _plan_hash(base) not in self.plans
+        if is_new:
             _attach_formatted_plan(df, sections)
         self.add_plan(sections, action, resolved_target, _extract_df_columns(df), site, extra)
 
@@ -1536,31 +1956,34 @@ class Capturer:
         """
         base = sections.get("analyzed") or sections.get("raw") or ""
         key = _plan_hash(base)
-        plan: Json | None = self.plans.get(key)
-        if plan is None:
-            plan = {
-                "id": f"P{len(self.plans) + 1:03d}",
-                "hash": key,
-                "output_columns": columns,
-                "sections": sections,
-                "occurrences": [],
-            }
-            self.plans[key] = plan
+        branch_label = self.explorer.active_branch_label
+        with self._lock:
+            plan: Json | None = self.plans.get(key)
+            if plan is None:
+                plan = {
+                    "id": f"P{len(self.plans) + 1:03d}",
+                    "hash": key,
+                    "output_columns": columns,
+                    "sections": sections,
+                    "occurrences": [],
+                }
+                self.plans[key] = plan
 
-        occurrences: list[Json] = plan["occurrences"]
-        new_sig = self._occurrence_sig(action, target, site, extra)
-        if any(
-            self._occurrence_sig(ex.get("action"), ex.get("target"), ex.get("call_site"), ex.get("extra")) == new_sig
-            for ex in occurrences
-        ):
-            return
+            occurrences: list[Json] = plan["occurrences"]
+            new_sig = self._occurrence_sig(action, target, site, extra)
+            if any(
+                self._occurrence_sig(ex.get("action"), ex.get("target"), ex.get("call_site"), ex.get("extra"))
+                == new_sig
+                for ex in occurrences
+            ):
+                return
 
-        occ: Json = {"action": action, "target": target, "call_site": site}
-        if self.explorer.active_branch_label:
-            occ["branch"] = self.explorer.active_branch_label
-        if extra:
-            occ["extra"] = extra
-        occurrences.append(occ)
+            occ: Json = {"action": action, "target": target, "call_site": site}
+            if branch_label:
+                occ["branch"] = branch_label
+            if extra:
+                occ["extra"] = extra
+            occurrences.append(occ)
 
     def event(self, kind: str, **info: Any) -> None:
         """Registra um evento interceptado que não gera plano (ex.: DDL bloqueado, operação Delta).
@@ -1572,21 +1995,23 @@ class Capturer:
         if not self.explorer.has_flipped:
             return
         site = self.call_site()
+        branch_label = self.explorer.active_branch_label
         new_sig = (kind, self._chain_key(site), info.get("statement_kind"), info.get("name"), info.get("query"))
-        for existing in self.events:
-            ex_sig = (
-                existing.get("kind"),
-                self._chain_key(existing.get("call_site")),
-                existing.get("statement_kind"),
-                existing.get("name"),
-                existing.get("query"),
-            )
-            if ex_sig == new_sig:
-                return
-        ev: Json = {"kind": kind, "call_site": site, **info}
-        if self.explorer.active_branch_label:
-            ev["branch"] = self.explorer.active_branch_label
-        self.events.append(ev)
+        with self._lock:
+            for existing in self.events:
+                ex_sig = (
+                    existing.get("kind"),
+                    self._chain_key(existing.get("call_site")),
+                    existing.get("statement_kind"),
+                    existing.get("name"),
+                    existing.get("query"),
+                )
+                if ex_sig == new_sig:
+                    return
+            ev: Json = {"kind": kind, "call_site": site, **info}
+            if branch_label:
+                ev["branch"] = branch_label
+            self.events.append(ev)
 
     def warn(self, message: str) -> None:
         """Adiciona um aviso associado ao ponto atual de chamada no projeto.
@@ -1595,7 +2020,9 @@ class Capturer:
             message: Texto descritivo do aviso.
         """
         if self.explorer.has_flipped:
-            self.warnings.append({"call_site": self.call_site(), "message": message})
+            site = self.call_site()
+            with self._lock:
+                self.warnings.append({"call_site": site, "message": message})
 
     def record_read(self, table: str | None) -> None:
         """Registra ``arquivo:linha`` onde o código do projeto iniciou a leitura de uma tabela.
@@ -1608,9 +2035,10 @@ class Capturer:
         if not site or not site.get("file"):
             return
         loc = f"{site['file']}:{site['line']}"
-        lst = self.read_sites.setdefault(norm, [])
-        if loc not in lst:
-            lst.append(loc)
+        with self._lock:
+            lst = self.read_sites.setdefault(norm, [])
+            if loc not in lst:
+                lst.append(loc)
 
     # ---- valores substitutos ---- #
     @staticmethod
@@ -1643,12 +2071,15 @@ class Capturer:
             return []
         chain = self._chain_key(self.call_site())
         ck = (chain, self._schema_key(df)) if chain else ()
-        if not self.explorer.has_flipped and ck in self._row_cache:
-            return list(self._row_cache[ck])
+        if not self.explorer.has_flipped:
+            with self._lock:
+                if ck in self._row_cache:
+                    return list(self._row_cache[ck])
         row = self._row(df)
         res = [row] if row is not None else []
         if ck:
-            self._row_cache[ck] = list(res)
+            with self._lock:
+                self._row_cache[ck] = list(res)
         return res
 
     def first_row(self, df: Any) -> Any:
@@ -1674,8 +2105,10 @@ class Capturer:
         """
         chain = self._chain_key(self.call_site())
         ck = (chain, self._schema_key(df)) if chain else ()
-        if not self.explorer.has_flipped and ck in self._pandas_cache:
-            return self._pandas_cache[ck].copy()
+        if not self.explorer.has_flipped:
+            with self._lock:
+                if ck in self._pandas_cache:
+                    return self._pandas_cache[ck].copy()
         try:
             import pandas as pd
 
@@ -1684,7 +2117,8 @@ class Capturer:
         except Exception:  # noqa: BLE001
             return None
         if ck:
-            self._pandas_cache[ck] = res.copy()
+            with self._lock:
+                self._pandas_cache[ck] = res.copy()
         return res
 
     @staticmethod
@@ -2015,6 +2449,8 @@ def _make_writer_factory(
                     df_obj = _as_dataframe(df, writer)
                 if target and (v2 or name in ("saveAsTable", "insertInto", "toTable")):
                     cap.record_written_table(target, df_obj)
+                elif target and name in ("save", "csv", "parquet", "json", "orc", "text", "xml", "start"):
+                    cap.record_written_path(target, df_obj)
                 fb = (
                     getattr(writer, "_spark_lineage_foreach_batch", None)
                     or getattr(writer, "_foreach_batch_fn", None)
@@ -2178,12 +2614,382 @@ def _make_table_read_factory(cap: Capturer) -> Callable[[Callable[..., Any]], Ca
     return table_read_factory
 
 
+_DF_KNOWN_ATTRS = frozenset(
+    {
+        "select",
+        "selectExpr",
+        "filter",
+        "where",
+        "withColumn",
+        "withColumns",
+        "withColumnRenamed",
+        "withColumnsRenamed",
+        "drop",
+        "dropDuplicates",
+        "drop_duplicates",
+        "distinct",
+        "join",
+        "crossJoin",
+        "union",
+        "unionAll",
+        "unionByName",
+        "intersect",
+        "intersectAll",
+        "subtract",
+        "exceptAll",
+        "groupBy",
+        "groupby",
+        "rollup",
+        "cube",
+        "agg",
+        "orderBy",
+        "sort",
+        "sortWithinPartitions",
+        "limit",
+        "offset",
+        "alias",
+        "repartition",
+        "coalesce",
+        "fillna",
+        "dropna",
+        "na",
+        "stat",
+        "write",
+        "writeTo",
+        "writeStream",
+        "schema",
+        "dtypes",
+        "columns",
+        "cache",
+        "persist",
+        "unpersist",
+        "is_cached",
+        "storageLevel",
+        "checkpoint",
+        "localCheckpoint",
+        "createTempView",
+        "createOrReplaceTempView",
+        "createGlobalTempView",
+        "createOrReplaceGlobalTempView",
+        "collect",
+        "count",
+        "isEmpty",
+        "first",
+        "head",
+        "take",
+        "tail",
+        "show",
+        "display",
+        "toPandas",
+        "toLocalIterator",
+        "toArrow",
+        "toDF",
+        "explain",
+        "printSchema",
+        "describe",
+        "summary",
+        "foreach",
+        "foreachPartition",
+        "sample",
+        "sampleBy",
+        "hint",
+        "transform",
+        "melt",
+        "unpivot",
+        "transpose",
+        "mergeInto",
+    }
+)
+_COL_LIST_METHODS = frozenset(
+    {"select", "drop", "groupBy", "groupby", "orderBy", "sort", "dropDuplicates", "drop_duplicates"}
+)
+_VALID_COL_RE = re.compile(r"^[A-Za-z_][\w\-.]*$")
+
+
+def _is_valid_inferred_col(name: str) -> bool:
+    s = name.strip()
+    if not s or s == "*" or "/" in s or "\\" in s or " " in s:
+        return False
+    return bool(_VALID_COL_RE.match(s))
+
+
+def _extract_str_constants(node: ast.AST) -> list[str]:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return [node.value]
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)):
+        out: list[str] = []
+        for elt in node.elts:
+            if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                out.append(elt.value)
+        return out
+    return []
+
+
+def _extract_col_calls(node: ast.AST) -> list[str]:
+    out: list[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, ast.Call):
+            tail = _dotted_name(child.func).rsplit(".", 1)[-1]
+            if tail in ("col", "column") and child.args:
+                out.extend(_extract_str_constants(child.args[0]))
+    return out
+
+
+def _get_parsed_file_ast(cap: Capturer, rel_file: str) -> ast.Module | None:
+    abspath = str((cap.root / rel_file).resolve())
+    with cap._lock:
+        if abspath in cap._ast_cache:
+            return cap._ast_cache[abspath]
+    tree: ast.Module | None = None
+    try:
+        raw_src = Path(abspath).read_text(encoding="utf-8")
+        pre = preprocess_notebook_source(raw_src, abspath)
+        tree = ast.parse(pre, filename=abspath)
+    except Exception:  # noqa: BLE001
+        tree = None
+    with cap._lock:
+        cap._ast_cache[abspath] = tree
+    return tree
+
+
+def _enclosing_stmt_list(tree: ast.Module, target_line: int) -> list[ast.stmt]:
+    best: list[ast.stmt] = tree.body
+    best_span = 10**9
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            start = getattr(node, "lineno", 0)
+            end = getattr(node, "end_lineno", start) or start
+            if start <= target_line <= end and (end - start) < best_span:
+                best = node.body
+                best_span = end - start
+    return best
+
+
+def _extract_sql_string_literal(node: ast.AST) -> str:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.JoinedStr):
+        return "".join(v.value for v in node.values if isinstance(v, ast.Constant) and isinstance(v.value, str))
+    return ""
+
+
+def _infer_sql_view_columns(stmts: list[ast.stmt], view_names: set[str]) -> list[str]:
+    if not view_names:
+        return []
+    cols: list[str] = []
+    for stmt in stmts:
+        for child in ast.walk(stmt):
+            if not isinstance(child, ast.Call):
+                continue
+            if _dotted_name(child.func).rsplit(".", 1)[-1] != "sql" or not child.args:
+                continue
+            sql_txt = _extract_sql_string_literal(child.args[0])
+            if not sql_txt:
+                continue
+            for vw in view_names:
+                m_al = re.search(rf"\b{re.escape(vw)}\b(?:\s+AS)?\s+([A-Za-z_]\w*)\b", sql_txt, re.I)
+                aliases = {vw}
+                if m_al and m_al.group(1).upper() not in ("ON", "WHERE", "JOIN", "INNER", "LEFT", "RIGHT", "FULL"):
+                    aliases.add(m_al.group(1))
+                for al in aliases:
+                    for m_col in re.finditer(rf"\b{re.escape(al)}\.(`[^`]+`|[A-Za-z_]\w*)", sql_txt):
+                        cname = m_col.group(1).strip("`")
+                        if _is_valid_inferred_col(cname) and cname not in cols:
+                            cols.append(cname)
+    return cols
+
+
+def _infer_reader_columns_from_ast(cap: Capturer, site: Json | None) -> list[str]:
+    """Infere nomes de colunas esperadas de um reader que falhou analisando os usos da variável na AST."""
+    if not site or not site.get("file") or not site.get("line"):
+        return []
+    tree = _get_parsed_file_ast(cap, str(site["file"]))
+    if tree is None:
+        return []
+
+    target_line = int(site["line"])
+    stmts = _enclosing_stmt_list(tree, target_line)
+    tracked_vars: set[str] = set()
+    read_stmt_idx = 0
+    for idx, stmt in enumerate(stmts):
+        start = getattr(stmt, "lineno", 0)
+        end = getattr(stmt, "end_lineno", start) or start
+        if start <= target_line <= end:
+            read_stmt_idx = idx
+            if isinstance(stmt, ast.Assign):
+                for tgt in stmt.targets:
+                    if isinstance(tgt, ast.Name):
+                        tracked_vars.add(tgt.id)
+            elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                tracked_vars.add(stmt.target.id)
+            break
+
+    cols: list[str] = []
+
+    def add_col(raw: str) -> None:
+        c = raw.strip().strip("`")
+        if _is_valid_inferred_col(c) and c not in cols:
+            cols.append(c)
+
+    def expr_uses_tracked(expr: ast.AST) -> bool:
+        return any(isinstance(n, ast.Name) and n.id in tracked_vars for n in ast.walk(expr))
+
+    def collect_from_call(call: ast.Call, is_target_receiver: bool) -> None:
+        if not isinstance(call.func, ast.Attribute):
+            return
+        mname = call.func.attr
+        if is_target_receiver:
+            if mname in _COL_LIST_METHODS:
+                for arg in call.args:
+                    for c in _extract_str_constants(arg):
+                        add_col(c)
+                    for c in _extract_col_calls(arg):
+                        add_col(c)
+            elif mname == "withColumnRenamed" and call.args:
+                for c in _extract_str_constants(call.args[0]):
+                    add_col(c)
+            elif mname in ("filter", "where", "withColumn", "withColumns", "agg"):
+                for arg in call.args:
+                    for c in _extract_col_calls(arg):
+                        add_col(c)
+                for kw_arg in call.keywords:
+                    for c in _extract_col_calls(kw_arg.value):
+                        add_col(c)
+        if mname == "join":
+            other_is_tracked = bool(call.args and expr_uses_tracked(call.args[0]))
+            if is_target_receiver or other_is_tracked:
+                on_node = next((k.value for k in call.keywords if k.arg == "on"), None)
+                if on_node is None and len(call.args) >= 2:
+                    on_node = call.args[1]
+                if on_node is not None:
+                    for c in _extract_str_constants(on_node):
+                        add_col(c)
+                    for c in _extract_col_calls(on_node):
+                        add_col(c)
+
+    relevant_stmts = stmts[read_stmt_idx:]
+    view_names: set[str] = set()
+
+    # Se não houve atribuição (chamada encadeada `spark.read.csv(...).select(...)`), inspeciona o próprio statement.
+    if not tracked_vars and relevant_stmts:
+        for child in ast.walk(relevant_stmts[0]):
+            if isinstance(child, ast.Call):
+                collect_from_call(child, is_target_receiver=True)
+        return cols
+
+    for stmt in relevant_stmts:
+        if isinstance(stmt, ast.Assign) and expr_uses_tracked(stmt.value):
+            for tgt in stmt.targets:
+                if isinstance(tgt, ast.Name):
+                    tracked_vars.add(tgt.id)
+        for child in ast.walk(stmt):
+            if isinstance(child, ast.Subscript) and isinstance(child.value, ast.Name) and child.value.id in tracked_vars:
+                for c in _extract_str_constants(child.slice):
+                    add_col(c)
+            elif isinstance(child, ast.Attribute) and isinstance(child.value, ast.Name) and child.value.id in tracked_vars:
+                if child.attr not in _DF_KNOWN_ATTRS and not child.attr.startswith("_"):
+                    add_col(child.attr)
+            elif isinstance(child, ast.Call) and isinstance(child.func, ast.Attribute):
+                is_recv = expr_uses_tracked(child.func.value)
+                collect_from_call(child, is_target_receiver=is_recv)
+                if is_recv and child.func.attr in ("createOrReplaceTempView", "createTempView") and child.args:
+                    view_names.update(_extract_str_constants(child.args[0]))
+
+    for c in _infer_sql_view_columns(relevant_stmts, view_names):
+        add_col(c)
+    return cols
+
+
+def _reader_spark_session(reader: Any) -> Any | None:
+    for attr in ("_spark", "_session", "sparkSession"):
+        sess = getattr(reader, attr, None)
+        if sess is not None and hasattr(sess, "sql"):
+            return sess
+    with contextlib.suppress(Exception):
+        return get_spark()
+    return None
+
+
+def _reader_explicit_schema(reader: Any, kw: dict[str, Any]) -> Any | None:
+    for cand in (kw.get("schema"), getattr(reader, "_spark_lineage_schema", None), getattr(reader, "_schema", None)):
+        if cand is not None:
+            return cand
+    return None
+
+
+def _schema_to_sql_cols(schema: Any) -> list[tuple[str, str]]:
+    if hasattr(schema, "fields"):
+        return [(f.name, f.dataType.simpleString()) for f in schema.fields]
+    if isinstance(schema, str):
+        out: list[tuple[str, str]] = []
+        for part in schema.split(","):
+            toks = part.strip().split(None, 1)
+            if len(toks) == 2:
+                out.append((toks[0].strip("`"), toks[1].strip()))
+        return out
+    return []
+
+
+def _build_synthetic_reader_df(spark: Any, explicit_schema: Any | None, inferred_cols: list[str]) -> tuple[Any, list[str]]:
+    if explicit_schema is not None:
+        schema_cols = _schema_to_sql_cols(explicit_schema)
+        if hasattr(spark, "createDataFrame"):
+            with contextlib.suppress(Exception):
+                return spark.createDataFrame([], explicit_schema), [c for c, _ in schema_cols]
+        if schema_cols:
+            proj = ", ".join(f"CAST(NULL AS {typ}) AS `{name.replace('`', '')}`" for name, typ in schema_cols)
+            return spark.sql(f"SELECT {proj} WHERE 1=0"), [c for c, _ in schema_cols]
+    col_names = inferred_cols or ["_c0"]
+    proj = ", ".join(f"CAST(NULL AS STRING) AS `{c.replace('`', '')}`" for c in col_names)
+    return spark.sql(f"SELECT {proj} WHERE 1=0"), col_names
+
+
+def _make_reader_schema_factory() -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def factory(original: Callable[..., Any]) -> Callable[..., Any]:
+        def schema(reader: Any, schema_arg: Any, *a: Any, **kw: Any) -> Any:
+            reader._spark_lineage_schema = schema_arg
+            return original(reader, schema_arg, *a, **kw)
+
+        return schema
+
+    return factory
+
+
 def _make_reader_path_factory(cap: Capturer, method: str = "") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     def reader_path_factory(original: Callable[..., Any]) -> Callable[..., Any]:
         def wrapper(reader: Any, *a: Any, **kw: Any) -> Any:
-            for t in _reader_targets(reader, a, kw, method=method):
+            targets = _reader_targets(reader, a, kw, method=method)
+            for t in targets:
                 cap.record_read(t)
-            return original(reader, *a, **kw)
+            for t in targets:
+                written_df = cap.get_written_path(t)
+                if written_df is not None:
+                    return written_df
+            try:
+                return original(reader, *a, **kw)
+            except Exception as exc:  # noqa: BLE001
+                spark = _reader_spark_session(reader)
+                if spark is None:
+                    raise
+                explicit_schema = _reader_explicit_schema(reader, kw)
+                inferred_cols = [] if explicit_schema is not None else _infer_reader_columns_from_ast(cap, cap.call_site())
+                try:
+                    synth_df, used_cols = _build_synthetic_reader_df(spark, explicit_schema, inferred_cols)
+                except Exception:  # noqa: BLE001
+                    raise exc from None
+                target_label = targets[0] if targets else "<path>"
+                cap.event(
+                    "reader_fallback",
+                    name=f"read.{method}",
+                    target=target_label,
+                    columns=used_cols,
+                    error=repr(exc)[:300],
+                )
+                cap.warn(
+                    f"read.{method}({target_label!r}) falhou ({type(exc).__name__}: {exc}); "
+                    f"usando DataFrame sintético vazio com colunas {used_cols}"
+                )
+                return synth_df
 
         return wrapper
 
@@ -2193,6 +2999,7 @@ def _make_reader_path_factory(cap: Capturer, method: str = "") -> Callable[[Call
 def _patch_sql_and_readers(p: Patcher, cap: Capturer) -> None:
     sql_factory = _make_sql_factory(p, cap)
     table_read_factory = _make_table_read_factory(cap)
+    reader_schema_factory = _make_reader_schema_factory()
 
     for cls in SESSION_CLASSES:
         p.patch(cls, "sql", sql_factory)
@@ -2200,6 +3007,7 @@ def _patch_sql_and_readers(p: Patcher, cap: Capturer) -> None:
         p.patch(cls, "stop", _make_blocked_factory(cap, "session_stop_blocked", "SparkSession.stop", lambda: None))
     for cls in (*READER_CLASSES, *STREAM_READER_CLASSES):
         p.patch(cls, "table", table_read_factory)
+        p.patch(cls, "schema", reader_schema_factory)
         for mname in READER_PATH_METHODS:
             p.patch(cls, mname, _make_reader_path_factory(cap, method=mname))
 
@@ -2327,14 +3135,16 @@ def _make_table_exists_factory(cap: Capturer) -> Callable[[Callable[..., Any]], 
             key = norm.lower()
             if key in cap.written_tables:
                 return True
-            if key in cap._table_exists_cache:
-                return cap._table_exists_cache[key]
+            with cap._lock:
+                if key in cap._table_exists_cache:
+                    return cap._table_exists_cache[key]
             try:
                 res = bool(original(catalog_obj, full_name))
             except Exception as exc:  # noqa: BLE001
                 cap.warn(f"catalog.tableExists({full_name!r}) falhou: {exc!r}")
                 res = False
-            cap._table_exists_cache[key] = res
+            with cap._lock:
+                cap._table_exists_cache[key] = res
             return res
 
         return table_exists
@@ -2618,41 +3428,90 @@ def _execute_forced_pass(
         cap.explorer.mark_target_status(f"error: {type(exc).__name__}: {exc}")
         m_site = re.match(r"^(.*?):(\d+)(?::\d+)?$", site_id)
         file_part, line_num = (m_site.group(1), int(m_site.group(2))) if m_site else (site_id, 0)
-        cap.warnings.append(
-            {
-                "call_site": {"file": file_part, "line": line_num},
-                "message": f"ramo forçado {site_id} ({cond_str} -> {forced_val}) "
-                f"interrompido com {type(exc).__name__}: {exc}",
-            }
-        )
+        with cap._lock:
+            cap.warnings.append(
+                {
+                    "call_site": {"file": file_part, "line": line_num},
+                    "message": f"ramo forçado {site_id} ({cond_str} -> {forced_val}) "
+                    f"interrompido com {type(exc).__name__}: {exc}",
+                }
+            )
 
 
-def _run_branch_passes(
+def _run_branch_passes(  # noqa: PLR0913, PLR0917
     ep: Path,
     args: list[str] | None,
     finder: _BranchMetaPathFinder,
     init_globals: Json,
     cap: Capturer,
     max_branch_passes: int,
+    branch_workers: int = 4,
 ) -> None:
-    for extra_pass in range(1, max_branch_passes + 1):
-        nxt = cap.explorer.next_unvisited()
-        if nxt is None:
-            break
-        site_id, forced_val, cond_str, planned_forces = nxt
-        print(
-            f"[capture_plans] explorando ramo adicional ({extra_pass}): {site_id} -> if ({cond_str}) = {forced_val}",
-            file=sys.stderr,
-        )
-        cap.explorer.start_pass(extra_pass, target_site=site_id, target_value=forced_val, planned_forces=planned_forces)
+    if max_branch_passes <= 0:
+        return
+
+    workers = max(1, branch_workers)
+    if workers == 1:
+        for extra_pass in range(1, max_branch_passes + 1):
+            nxt = cap.explorer.next_unvisited()
+            if nxt is None:
+                break
+            site_id, forced_val, cond_str, planned_forces = nxt
+            print(
+                f"[capture_plans] explorando ramo adicional ({extra_pass}): "
+                f"{site_id} -> if ({cond_str}) = {forced_val}",
+                file=sys.stderr,
+            )
+            cap.explorer.start_pass(
+                extra_pass, target_site=site_id, target_value=forced_val, planned_forces=planned_forces
+            )
+            cap.written_tables.clear()
+            cap.written_paths.clear()
+            dbutils_obj = init_globals.get("dbutils")
+            if dbutils_obj is not None and hasattr(dbutils_obj, "widgets"):
+                dbutils_obj.widgets.reset_thread_state(cap.params)
+            _clear_project_modules(cap.root_prefix, cap._tool_file)
+            sys.argv = [str(ep), *(args or [])]
+            _execute_forced_pass(ep, finder, init_globals, cap, (site_id, cond_str, forced_val))
+        return
+
+    sys.argv = [str(ep), *(args or [])]
+
+    def _run_worker(
+        pass_idx: int,
+        site_id: str,
+        forced_val: bool,
+        cond_str: str,
+        planned_forces: dict[str, bool],
+    ) -> None:
+        cap.explorer.start_pass(pass_idx, target_site=site_id, target_value=forced_val, planned_forces=planned_forces)
         cap.written_tables.clear()
+        cap.written_paths.clear()
         dbutils_obj = init_globals.get("dbutils")
         if dbutils_obj is not None and hasattr(dbutils_obj, "widgets"):
-            dbutils_obj.widgets._p = dict(cap.params)
-            dbutils_obj.widgets._defaults.clear()
-        _clear_project_modules(cap.root_prefix, cap._tool_file)
-        sys.argv = [str(ep), *(args or [])]
+            dbutils_obj.widgets.reset_thread_state(cap.params)
         _execute_forced_pass(ep, finder, init_globals, cap, (site_id, cond_str, forced_val))
+
+    dispatched = 0
+    in_flight: set[concurrent.futures.Future[None]] = set()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        while True:
+            capacity = min(workers - len(in_flight), max_branch_passes - dispatched)
+            if capacity > 0:
+                batch = cap.explorer.next_unvisited_batch(capacity)
+                for site_id, forced_val, cond_str, planned_forces in batch:
+                    dispatched += 1
+                    print(
+                        f"[capture_plans] explorando ramo adicional ({dispatched}): "
+                        f"{site_id} -> if ({cond_str}) = {forced_val}",
+                        file=sys.stderr,
+                    )
+                    in_flight.add(pool.submit(_run_worker, dispatched, site_id, forced_val, cond_str, planned_forces))
+            if not in_flight:
+                break
+            done, in_flight = concurrent.futures.wait(in_flight, return_when=concurrent.futures.FIRST_COMPLETED)
+            for fut in done:
+                fut.result()
 
 
 def _restore_builtins(old_builtins: dict[str, Any]) -> None:
@@ -2691,6 +3550,7 @@ def capture_plans(  # noqa: PLR0913, PLR0917
     explore_branches: bool = True,
     max_branch_passes: int = 10,
     fetch_catalog: bool = True,
+    branch_workers: int = 4,
 ) -> Json:
     """Executa o entrypoint com as actions interceptadas e devolve o documento completo.
 
@@ -2705,6 +3565,7 @@ def capture_plans(  # noqa: PLR0913, PLR0917
         explore_branches: Se ``True``, reexecuta o job invertendo ramos ``if/else`` não visitados.
         max_branch_passes: Limite de passadas extras para exploração de ramos.
         fetch_catalog: Se ``True``, consulta tipos e comentários das tabelas no Unity Catalog ao final.
+        branch_workers: Número de threads paralelas para explorar ramos (padrão: 4; ``1`` para sequencial).
 
     Returns:
         Dicionário autocontido com planos, catálogo, fontes, destinos, fluxos, ramos, eventos e avisos.
@@ -2743,7 +3604,14 @@ def capture_plans(  # noqa: PLR0913, PLR0917
 
         init_globals: Json = {"display": display}
 
-        active_notebooks: set[Path] = {ep.resolve()}
+        nb_tls = threading.local()
+
+        def _active_notebooks() -> set[Path]:
+            active = getattr(nb_tls, "active", None)
+            if active is None:
+                active = {ep.resolve()}
+                nb_tls.active = active
+            return active
 
         def run_child_notebook(path_str: str, child_args: dict[str, Any]) -> str:
             site = cap.call_site()
@@ -2754,6 +3622,7 @@ def capture_plans(  # noqa: PLR0913, PLR0917
                 cap.warn(f"dbutils.notebook.run: notebook não encontrado localmente: {path_str}")
                 return ""
             resolved = target_nb.resolve()
+            active_notebooks = _active_notebooks()
             if resolved in active_notebooks:
                 cap.event("notebook_run_cycle", target=str(target_nb))
                 cap.warn(f"dbutils.notebook.run: ciclo detectado ao chamar {target_nb.name}; ignorado")
@@ -2784,6 +3653,7 @@ def capture_plans(  # noqa: PLR0913, PLR0917
                 cap.warn(f"%run: notebook não encontrado localmente: {target_str}")
                 return
             resolved = target_nb.resolve()
+            active_notebooks = _active_notebooks()
             if resolved in active_notebooks:
                 cap.event("magic_run_cycle", target=str(target_nb))
                 cap.warn(f"%run: ciclo detectado ao chamar {target_nb.name}; ignorado")
@@ -2834,7 +3704,9 @@ def capture_plans(  # noqa: PLR0913, PLR0917
 
         status, error = _run_first_pass(ep, finder, init_globals, cap)
         if explore_branches and status == "ok":
-            _run_branch_passes(ep, args, finder, init_globals, cap, max_branch_passes)
+            _run_branch_passes(
+                ep, args, finder, init_globals, cap, max_branch_passes, branch_workers=branch_workers
+            )
     finally:
         if finder in sys.meta_path:
             sys.meta_path.remove(finder)
@@ -2855,6 +3727,7 @@ def capture_plans(  # noqa: PLR0913, PLR0917
             "collect_mode": collect_mode,
             "count_value": count_value,
             "explore_branches": explore_branches,
+            "branch_workers": branch_workers,
             "fetch_catalog": fetch_catalog,
         },
         "status": status,
@@ -2938,9 +3811,25 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="máximo de passadas extras para explorar ramos if/else (padrão: 10)",
     )
     ap.add_argument(
+        "--branch-workers",
+        type=int,
+        default=4,
+        help="número de threads paralelas para explorar ramos if/else (padrão: 4; use 1 para sequencial)",
+    )
+    ap.add_argument(
         "--no-catalog",
         action="store_true",
         help="não consultar schemas/comentários das tabelas no Unity Catalog ao final da captura",
+    )
+    ap.add_argument(
+        "--raw",
+        action="store_true",
+        help="grava o JSON bruto (com sections completos dos planos) em --output em vez do formato compactado padrão",
+    )
+    ap.add_argument(
+        "--raw-output",
+        default=None,
+        help="opcional: grava também o JSON bruto completo em um arquivo separado (para depuração)",
     )
     return ap
 
@@ -2948,12 +3837,17 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     """Ponto de entrada CLI do subcomando ``spark-lineage capture``.
 
+    Por padrão grava o artefato **compactado** (``spark-lineage-compact/v1``, sem ``plans[*].sections``)
+    em ``--output``, com fontes, destinos, fluxos, ramos, queries SQL e linhagem por coluna já pré-calculados.
+
     Args:
         argv: Lista de argumentos de linha de comando (usa ``sys.argv[1:]`` se ``None``).
 
     Returns:
         Código de saída (0 para sucesso, 1 para erro durante a execução do job).
     """
+    from .compact import compact_plan
+
     ns = _build_arg_parser().parse_args(argv)
     params = dict(p.split("=", 1) for p in ns.param if "=" in p)
     result = capture_plans(
@@ -2967,14 +3861,23 @@ def main(argv: list[str] | None = None) -> int:
         explore_branches=not ns.no_explore_branches,
         max_branch_passes=ns.max_branch_passes,
         fetch_catalog=not ns.no_catalog,
+        branch_workers=ns.branch_workers,
     )
 
+    payload = result if ns.raw else compact_plan(result)
     out_path = Path(ns.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(
-        json.dumps(result, indent=2, ensure_ascii=False, default=str),
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str),
         encoding="utf-8",
     )
+    if ns.raw_output:
+        raw_path = Path(ns.raw_output)
+        raw_path.parent.mkdir(parents=True, exist_ok=True)
+        raw_path.write_text(
+            json.dumps(result, indent=2, ensure_ascii=False, default=str),
+            encoding="utf-8",
+        )
     if ns.text_dir:
         _write_text_dir(result, Path(ns.text_dir))
 
@@ -2982,8 +3885,9 @@ def main(argv: list[str] | None = None) -> int:
     n_br = len(result.get("branches", []))
     n_src = len(result.get("sources", []))
     n_dst = len(result.get("destinations", []))
+    mode_lbl = "bruto" if ns.raw else "compacto"
     print(
-        f"[capture_plans] status={result['status']} planos={len(result['plans'])} "
+        f"[capture_plans] status={result['status']} ({mode_lbl}) planos={len(result['plans'])} "
         f"ocorrências={n_occ} fontes={n_src} destinos={n_dst} ramos={n_br} "
         f"eventos={len(result['events'])} avisos={len(result['warnings'])} -> {ns.output}",
         file=sys.stderr,

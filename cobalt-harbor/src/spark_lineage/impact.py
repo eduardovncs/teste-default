@@ -677,13 +677,70 @@ class _ImpactSearch:
                 entry["columns"].append(oc)
 
 
+def _trace_from_compact(
+    result: Json,
+    resolved_table: str,
+    source_meta: Json | None,
+    col_meta: Json | None,
+    column: str,
+) -> Json:
+    lineage = result.get("column_lineage") or {}
+    tbl_entry = lineage.get(resolved_table)
+    if tbl_entry is None:
+        for k, v in lineage.items():
+            if _match_table(k, resolved_table) or _match_table(resolved_table, k):
+                resolved_table = k
+                tbl_entry = v
+                break
+    col_entry = None
+    if isinstance(tbl_entry, dict):
+        col_entry = tbl_entry.get(column)
+        if col_entry is None:
+            low = column.lower()
+            for cname, cinfo in tbl_entry.items():
+                if cname.lower() == low:
+                    column = cname
+                    col_entry = cinfo
+                    break
+    if col_entry is not None:
+        return {
+            "entrypoint": result.get("entrypoint"),
+            "table": resolved_table,
+            "column": column,
+            "type": col_entry.get("type") or (col_meta or {}).get("type"),
+            "comment": col_entry.get("comment") or (col_meta or {}).get("comment"),
+            "read_sites": col_entry.get("read_sites") or (source_meta or {}).get("call_sites", []),
+            "summary": dict(col_entry.get("summary") or {}),
+            "destinations_affected": list(col_entry.get("destinations_affected") or []),
+            "hops": list(col_entry.get("hops") or []),
+        }
+    meta = col_meta or {}
+    return {
+        "entrypoint": result.get("entrypoint"),
+        "table": resolved_table,
+        "column": column,
+        "type": meta.get("type"),
+        "comment": meta.get("comment"),
+        "read_sites": (source_meta or {}).get("call_sites", []),
+        "summary": {
+            "found": False,
+            "hops": 0,
+            "plans_affected": 0,
+            "operations_count": 0,
+            "destinations_affected": 0,
+        },
+        "destinations_affected": [],
+        "hops": [],
+    }
+
+
 def trace_column_impact(result: Json, table: str, column: str, max_hops: int = 5) -> Json:
-    """Rastreia uma coluna ``(table, column)`` de ponta a ponta por todos os planos do plan.json.
+    """Rastreia uma coluna ``(table, column)`` de ponta a ponta (aceita ``plan.json`` bruto ou compactado).
 
     Encadeia automaticamente através de tabelas intermediárias (staging).
 
     Args:
-        result: Documento gerado pelo ``capture`` (plan.json).
+        result: Documento gerado pelo ``capture`` (bruto ou compactado ``spark-lineage-compact/v1``).
         table: Nome completo ou sufixo da tabela de origem.
         column: Nome da coluna a rastrear (sem diferenciar maiúsculas).
         max_hops: Máximo de saltos através de tabelas intermediárias.
@@ -700,6 +757,9 @@ def trace_column_impact(result: Json, table: str, column: str, max_hops: int = 5
         None,
     )
     col_meta, column = _resolve_column(source_meta, cat_tbl, column)
+
+    if str(result.get("format", "")).startswith("spark-lineage-compact/") and not result.get("plans"):
+        return _trace_from_compact(result, resolved_table, source_meta, col_meta, column)
 
     search = _ImpactSearch(result.get("plans", []), max_hops)
     search.run(resolved_table, column)

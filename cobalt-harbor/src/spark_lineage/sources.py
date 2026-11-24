@@ -23,7 +23,20 @@ from .plan_parser import (
 )
 
 WRITE_PREFIXES = ("write.", "writeStream.")
-VALID_TAGS = ("all", "sources", "destinations", "flows", "views", "branches", "events", "warnings", "catalog", "plans")
+VALID_TAGS = (
+    "all",
+    "sources",
+    "destinations",
+    "flows",
+    "views",
+    "branches",
+    "queries",
+    "column_lineage",
+    "events",
+    "warnings",
+    "catalog",
+    "plans",
+)
 _IN_PLACE_DML_ACTIONS = ("sql:DELETE", "sql:UPDATE")
 _SQL_READ_ACTIONS = frozenset({"sql:SELECT", "sql:WITH", "sql:VALUES", "sql:TABLE", "sql:FROM"})
 _UNNAMED_MERGE = "<merge sem destino nomeado>"
@@ -129,6 +142,46 @@ def discover_plan_tables(plans: list[Json]) -> list[str]:
             if _is_real_table(t):
                 _add(tables, t)
     return tables
+
+
+def discover_doc_tables(doc: Json) -> list[str]:
+    """Lista todas as tabelas reais tanto de um ``plan.json`` bruto quanto de um documento compactado."""
+    if doc.get("plans"):
+        return discover_plan_tables(doc["plans"])
+    tables: list[str] = []
+    for item in [*(doc.get("sources") or []), *(doc.get("destinations") or [])]:
+        t = item.get("table")
+        if _is_real_table(t):
+            _add(tables, t)
+    return tables
+
+
+def extract_plan_queries(plans: list[Json]) -> list[Json]:
+    """Extrai e deduplica todas as queries SQL registradas nas ocorrências dos planos."""
+    out: list[Json] = []
+    seen: set[tuple[Any, ...]] = set()
+    for plan in plans:
+        pid = plan.get("id")
+        for occ in plan.get("occurrences", []):
+            q = ((occ.get("extra") or {}).get("query") or "").strip()
+            if not q:
+                continue
+            site = site_label(occ)
+            sig = (pid, occ.get("action"), occ.get("target"), site, q)
+            if sig in seen:
+                continue
+            seen.add(sig)
+            item: Json = {
+                "plan": pid,
+                "action": occ.get("action"),
+                "target": occ.get("target"),
+                "call_site": site,
+                "query": q,
+            }
+            if occ.get("branch"):
+                item["branch"] = occ["branch"]
+            out.append(item)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -533,16 +586,78 @@ def _normalize_event(e: Json) -> Json:
     }
 
 
+def _is_compact_format(result: Json) -> bool:
+    return isinstance(result, dict) and str(result.get("format", "")).startswith("spark-lineage-compact/")
+
+
+def _enrich_compact_with_catalog(sources: list[Json], destinations: list[Json], catalog: Catalog) -> tuple[list[Json], list[Json]]:
+    cat_ci = {k.replace("`", "").strip().lower(): v for k, v in catalog.items() if isinstance(v, dict)}
+
+    def lookup(table: str | None) -> Json | None:
+        if not table:
+            return None
+        return catalog.get(table) or cat_ci.get(table.replace("`", "").strip().lower())
+
+    out_sources: list[Json] = []
+    for s in sources:
+        sc = dict(s)
+        cat_s = lookup(s.get("table"))
+        cols = [dict(c) for c in s.get("columns", [])]
+        if cat_s:
+            _enrich_columns(cols, cat_s)
+            seen_low = {c["name"].lower() for c in cols}
+            for cn, cinfo in cat_s.items():
+                if cn.lower() not in seen_low:
+                    item: Json = {"name": cn, "type": cinfo.get("type"), "read": None}
+                    if cinfo.get("comment"):
+                        item["comment"] = cinfo["comment"]
+                    cols.append(item)
+            sc["types_from"] = "catalog"
+            sc["columns_truncated"] = False
+        sc["columns"] = cols
+        out_sources.append(sc)
+
+    out_dests: list[Json] = []
+    for d in destinations:
+        dc = dict(d)
+        cat_d = lookup(d.get("table"))
+        if cat_d and d.get("columns"):
+            cols = [dict(c) for c in d["columns"]]
+            _enrich_columns(cols, cat_d)
+            dc["columns"] = cols
+        out_dests.append(dc)
+    return out_sources, out_dests
+
+
 def build_sources(result: Json, catalog: Catalog | None = None) -> Json:
     """Consolida fontes, destinos, views, fluxos, ramos e avisos a partir do resultado da captura.
 
+    Aceita tanto o ``plan.json`` bruto quanto o documento compactado ``spark-lineage-compact/v1``.
+
     Args:
-        result: Documento gerado pelo ``capture`` (plan.json).
-        catalog: Schemas do Unity Catalog; se ``None``, usa ``result['catalog']`` já salvo no plan.json.
+        result: Documento gerado pelo ``capture`` (bruto ou compactado).
+        catalog: Schemas do Unity Catalog; se ``None``, usa ``result['catalog']`` já salvo no arquivo.
 
     Returns:
         Documento consolidado com ``sources``, ``views``, ``destinations``, ``flows``, ``events`` e ``warnings``.
     """
+    if _is_compact_format(result):
+        sources = list(result.get("sources") or [])
+        dests = list(result.get("destinations") or [])
+        if catalog is not None:
+            sources, dests = _enrich_compact_with_catalog(sources, dests, catalog)
+        return {
+            "entrypoint": result.get("entrypoint"),
+            "capture_status": result.get("capture_status", result.get("status")),
+            "plans_analyzed": result.get("plans_analyzed", 0),
+            "sources": sources,
+            "views": list(result.get("views") or []),
+            "destinations": dests,
+            "flows": list(result.get("flows") or []),
+            "events": [_normalize_event(e) for e in result.get("events", [])],
+            "warnings": list(result.get("warnings") or []),
+        }
+
     if catalog is None:
         catalog = result.get("catalog")
     read_sites = result.get("read_sites") or {}
@@ -622,9 +737,30 @@ def _tag_plans(result: Json, doc: Json, table: str | None) -> list[Json]:
     return [p for p in plans if p.get("id") in pids]
 
 
+def _tag_queries(result: Json, _doc: Json, table: str | None) -> list[Json]:
+    queries = list(result.get("queries") or []) if "queries" in result else extract_plan_queries(result.get("plans", []))
+    if not table:
+        return queries
+    tf = table.lower().replace("`", "").strip()
+    return [
+        q
+        for q in queries
+        if _match_table(q.get("target"), table) or tf in (q.get("query") or "").lower()
+    ]
+
+
+def _tag_column_lineage(result: Json, _doc: Json, table: str | None) -> dict[str, Any]:
+    lineage = result.get("column_lineage") or {}
+    if not table:
+        return lineage
+    return {k: v for k, v in lineage.items() if _match_table(k, table)}
+
+
 _TAG_HANDLERS: dict[str, Callable[[Json, Json, str | None], Any]] = {
     "all": _tag_all,
     "branches": _tag_branches,
+    "queries": _tag_queries,
+    "column_lineage": _tag_column_lineage,
     "catalog": _tag_catalog,
     "plans": _tag_plans,
 }
@@ -740,6 +876,17 @@ def _md_branches(doc: Json) -> list[str]:
     return [f"## Ramos de decisão explorados ({len(branches)})"] + [_md_branch(b) for b in branches]
 
 
+def _md_queries(doc: Json) -> list[str]:
+    queries = doc.get("queries") or []
+    lines = [f"## Queries SQL ({len(queries)})"]
+    for q in queries:
+        tgt = f" -> `{q['target']}`" if q.get("target") else ""
+        site = f" @ `{q['call_site']}`" if q.get("call_site") else ""
+        single_line = " ".join((q.get("query") or "").split())
+        lines.append(f"- `{q.get('action', '')}`{tgt}{site}: `{single_line[:240]}`")
+    return lines
+
+
 def _md_events(doc: Json) -> list[str]:
     return [
         "## Não executado durante a captura",
@@ -758,6 +905,7 @@ _MD_SECTIONS: tuple[tuple[str, tuple[str, ...], bool, Callable[[Json], list[str]
     ("destinations", ("all", "destinations"), False, _md_destinations),
     ("flows", ("all", "flows"), False, _md_flows),
     ("branches", ("branches",), False, _md_branches),
+    ("queries", ("queries",), False, _md_queries),
     ("events", ("all", "events"), True, _md_events),
     ("warnings", ("all", "warnings"), True, _md_warnings),
 )
