@@ -811,3 +811,35 @@ def test_binds_multiple_arguments_for_local_and_imported_helpers(tmp_path: Path)
     }
     assert {e.target for e in res.outputs} == {"pr_x.xpto_ing.tb_b"}
     assert res.unresolved_dynamic == []
+
+
+def test_resolves_star_import_and_package_reexport(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "functions.py",
+        """
+        def check_if_table_exists(spark, table):
+            return spark.sql(
+                "select exists (select 1 from {table_of_book} limit 1)".format(table_of_book=table)
+            ).collect()
+        """,
+    )
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        from functions import *
+
+        book_table = "pr_x.xpto_ing.x"
+
+        def main(spark):
+            if check_if_table_exists(spark, book_table):
+                pass
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    assert {e.target for e in res.inputs} == {"pr_x.xpto_ing.x"}
+    assert res.unclassified_table_refs == []
+    assert res.unresolved_dynamic == []

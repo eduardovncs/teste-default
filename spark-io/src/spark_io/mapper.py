@@ -432,6 +432,35 @@ def _copy_env_subset(src: EnvScope, dst: EnvScope, names: set[str] | None) -> No
             dst.lists[key] = list(val)
 
 
+def _register_reexports(stmt: ast.ImportFrom, env: EnvScope) -> None:
+    """Registra símbolos re-exportados via `from sub import nome` dentro de um módulo.
+
+    Args:
+        stmt: Declaração `ast.ImportFrom` encontrada no corpo do módulo importado.
+        env: Escopo simbólico destino.
+    """
+    if not stmt.module:
+        return
+    for alias in stmt.names:
+        if alias.name != "*":
+            env.imported_symbols[alias.asname or alias.name] = (stmt.module, alias.name)
+
+
+def _register_star_exports(mod_name: str, tree: ast.Module, env: EnvScope) -> None:
+    """Registra funções e classes públicas exportadas por `from mod import *`.
+
+    Args:
+        mod_name: Nome pontuado do módulo local.
+        tree: AST do módulo importado.
+        env: Escopo simbólico destino.
+    """
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and not node.name.startswith("_"):
+            env.imported_symbols[node.name] = (mod_name, node.name)
+        elif isinstance(node, ast.ImportFrom):
+            _register_reexports(node, env)
+
+
 def _handle_import_from(ctx: _MapperContext, stmt: ast.ImportFrom, env: EnvScope) -> None:
     """Carrega constantes e registra símbolos importados de módulos locais.
 
@@ -448,12 +477,15 @@ def _handle_import_from(ctx: _MapperContext, stmt: ast.ImportFrom, env: EnvScope
     _, tree = _load_and_parse(ctx, mod_path)
     if tree is None:
         return
-    wanted = None if any(a.name == "*" for a in stmt.names) else {a.name for a in stmt.names}
+    is_star = any(a.name == "*" for a in stmt.names)
+    wanted = None if is_star else {a.name for a in stmt.names}
     _copy_env_subset(_collect_module_env(ctx, tree), env, wanted)
+    if is_star:
+        _register_star_exports(stmt.module, tree, env)
+        return
     for alias in stmt.names:
-        if alias.name != "*":
-            local_name = alias.asname or alias.name
-            env.imported_symbols[local_name] = (stmt.module, alias.name)
+        local_name = alias.asname or alias.name
+        env.imported_symbols[local_name] = (stmt.module, alias.name)
 
 
 def _handle_plain_import(ctx: _MapperContext, stmt: ast.Import, env: EnvScope) -> None:
