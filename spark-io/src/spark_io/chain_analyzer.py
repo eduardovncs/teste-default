@@ -6,7 +6,15 @@ import ast
 from dataclasses import dataclass, field
 
 from spark_io.models import IoKind, TargetType
-from spark_io.partial_eval import WILDCARD, EnvScope, apply_env_prefix, eval_str_dict, eval_str_expr
+from spark_io.partial_eval import (
+    WILDCARD,
+    BuilderState,
+    EnvScope,
+    apply_env_prefix,
+    eval_str_dict,
+    eval_str_expr,
+    eval_str_list,
+)
 
 _READ_TERMINALS = frozenset({"table", "load", "parquet", "csv", "json", "orc", "delta", "jdbc", "text"})
 _WRITE_TERMINALS = frozenset(
@@ -17,6 +25,12 @@ _WRITE_TO_TERMINALS = frozenset({"create", "append", "overwrite", "overwritePart
 _DELTA_WRITE_METHODS = frozenset({"merge", "update", "delete"})
 _TEMP_VIEW_METHODS = frozenset({"createOrReplaceTempView", "createTempView", "createGlobalTempView"})
 _TARGET_KWARGS = ("path", "name", "tableName", "table")
+_ANCHOR_SPECS: tuple[tuple[str, IoKind, frozenset[str]], ...] = (
+    ("read", "read", _READ_TERMINALS),
+    ("readStream", "read", _READ_TERMINALS),
+    ("write", "write", _WRITE_TERMINALS),
+    ("writeStream", "write", _WRITE_TERMINALS),
+)
 
 
 @dataclass(frozen=True)
@@ -40,8 +54,9 @@ class PrimitiveMatch:
         kind: Direção (`"read"` ou `"write"`).
         via: Nome padronizado da primitiva (ex.: `"read.table"`, `"write.saveAsTable"`).
         target_node: Nó AST do argumento de alvo, quando presente na chamada.
-        target_value: Alvo já avaliado (ou `<*>` quando opaco).
-        dynamic: Indica se o alvo ainda contém `<*>`.
+        target_value: Alvo principal já avaliado (ou `<*>` quando opaco).
+        dynamic: Indica se o alvo principal ainda contém `<*>`.
+        extra_targets: Alvos adicionais quando uma lista de caminhos é passada (ex.: `.parquet([a, b])`).
         target_type: Tipo do alvo (`"table"`, `"path"` ou `"unknown"`).
         receiver: Expressão textual do objeto receptor raiz.
         data_format: Formato de dados coletado via `.format(...)`.
@@ -55,6 +70,7 @@ class PrimitiveMatch:
     target_node: ast.expr | None
     target_value: str
     dynamic: bool
+    extra_targets: tuple[str, ...] = ()
     target_type: TargetType = "table"
     receiver: str | None = None
     data_format: str | None = None
@@ -221,6 +237,90 @@ def _collect_chain_options(steps: list[ChainStep], env: EnvScope) -> _ChainOpts:
     return collected
 
 
+def _merge_builder_opts(base: BuilderState, extra: _ChainOpts) -> _ChainOpts:
+    """Combina opções já acumuladas em um `BuilderState` com novas opções da cadeia.
+
+    Args:
+        base: Estado anterior do builder.
+        extra: Novas opções coletadas na linha atual.
+
+    Returns:
+        `_ChainOpts` mesclado com precedência para `extra`.
+    """
+    merged_opts = dict(base.options)
+    merged_opts.update(extra.options)
+    return _ChainOpts(
+        data_format=extra.data_format or base.data_format,
+        mode=extra.mode or base.mode,
+        options=merged_opts,
+    )
+
+
+def extract_builder_state(expr: ast.expr, env: EnvScope) -> BuilderState | None:
+    """Detecta cadeias incompletas de reader/writer atribuídas a variáveis intermediárias.
+
+    Args:
+        expr: Expressão do lado direito de uma atribuição (ex.: `conector.read.format("parquet")`).
+        env: Escopo simbólico atual.
+
+    Returns:
+        `BuilderState` atualizado ou `None` quando a expressão não for builder incompleto.
+    """
+    root, steps = unwind_chain(expr)
+    if not steps:
+        return None
+    last_attr = steps[-1].attr
+
+    if isinstance(root, ast.Name) and root.id in env.builders:
+        base = env.builders[root.id]
+        terminals = _READ_TERMINALS if base.kind == "read" else _WRITE_TERMINALS
+        if steps[-1].call is not None and last_attr in terminals:
+            return None
+        merged = _merge_builder_opts(base, _collect_chain_options(steps, env))
+        return BuilderState(
+            kind=base.kind,
+            anchor=base.anchor,
+            receiver=base.receiver,
+            data_format=merged.data_format,
+            mode=merged.mode,
+            options=merged.options,
+        )
+
+    return _extract_fresh_builder(root, steps, env)
+
+
+def _extract_fresh_builder(root: ast.expr, steps: list[ChainStep], env: EnvScope) -> BuilderState | None:
+    """Detecta o início de um builder `*.read.*` ou `*.write.*` sem chamada terminal.
+
+    Args:
+        root: Nó raiz da cadeia.
+        steps: Passos desenrolados da cadeia.
+        env: Escopo simbólico atual.
+
+    Returns:
+        Novo `BuilderState` ou `None`.
+    """
+    attrs = [s.attr for s in steps]
+    last_is_call = steps[-1].call is not None
+    last_attr = steps[-1].attr
+    for anchor, kind, terminals in _ANCHOR_SPECS:
+        if anchor not in attrs or (last_is_call and last_attr in terminals):
+            continue
+        idx = attrs.index(anchor)
+        opts = _collect_chain_options(steps[idx + 1 :], env)
+        root_text = ast.unparse(root)
+        receiver = root_text if idx == 0 else f"{root_text}.{'.'.join(attrs[:idx])}"
+        return BuilderState(
+            kind=kind,
+            anchor=anchor,
+            receiver=receiver,
+            data_format=opts.data_format,
+            mode=opts.mode,
+            options=opts.options,
+        )
+    return None
+
+
 def _resolve_target_from_options(opts: _ChainOpts, env_prefix: str) -> tuple[str, bool, TargetType]:
     """Busca alvo alternativo nas opções `.option("path"/"dbtable"/"table", ...)`.
 
@@ -245,8 +345,8 @@ def _resolve_target_and_type(
     opts: _ChainOpts,
     env: EnvScope,
     env_prefix: str,
-) -> tuple[str, bool, TargetType, str | None]:
-    """Resolve alvo, flag dinâmica, tipo e expressão original de um terminal read/write.
+) -> tuple[str, tuple[str, ...], bool, TargetType, str | None]:
+    """Resolve alvo(s), flag dinâmica, tipo e expressão original de um terminal read/write.
 
     Args:
         arg_node: Nó AST do argumento direto do terminal, se houver.
@@ -256,18 +356,125 @@ def _resolve_target_and_type(
         env_prefix: Prefixo padrão de ambiente (`pr`).
 
     Returns:
-        Tupla `(target_value, dynamic, target_type, raw_expr)`.
+        Tupla `(target_value, extra_targets, dynamic, target_type, raw_expr)`.
     """
     if arg_node is None:
         target, is_dyn, t_type = _resolve_target_from_options(opts, env_prefix)
-        return target, is_dyn, t_type, None
+        return target, (), is_dyn, t_type, None
+
+    list_vals = eval_str_list(arg_node, env)
+    if list_vals:
+        resolved_items = [apply_env_prefix(item, env_prefix)[0] for item in list_vals]
+        first = resolved_items[0]
+        return first, tuple(resolved_items[1:]), (WILDCARD in first), "path", _expr_text(arg_node)
 
     raw_val = eval_str_expr(arg_node, env)
     resolved, is_dyn = apply_env_prefix(raw_val, env_prefix)
     target_type: TargetType = "table" if terminal in _TABLE_TERMINALS else "path"
     if resolved.startswith("/") or "://" in resolved:
         target_type = "path"
-    return resolved, is_dyn, target_type, _expr_text(arg_node)
+    return resolved, (), is_dyn, target_type, _expr_text(arg_node)
+
+
+def _match_builder_terminal(
+    root: ast.expr,
+    steps: list[ChainStep],
+    env: EnvScope,
+    env_prefix: str,
+) -> PrimitiveMatch | None:
+    """Detecta chamada terminal sobre uma variável builder rastreada (ex.: `reader.load()`).
+
+    Args:
+        root: Nó raiz da cadeia.
+        steps: Passos da cadeia.
+        env: Escopo simbólico atual.
+        env_prefix: Prefixo padrão de ambiente (`pr`).
+
+    Returns:
+        `PrimitiveMatch` correspondente ou `None`.
+    """
+    if not isinstance(root, ast.Name) or root.id not in env.builders or not steps or steps[-1].call is None:
+        return None
+    base = env.builders[root.id]
+    terminals = _READ_TERMINALS if base.kind == "read" else _WRITE_TERMINALS
+    last_attr = steps[-1].attr
+    if last_attr not in terminals:
+        return None
+    opts = _merge_builder_opts(base, _collect_chain_options(steps, env))
+    arg_node = _extract_call_arg(steps[-1].call)
+    target, extras, is_dyn, t_type, raw_expr = _resolve_target_and_type(arg_node, last_attr, opts, env, env_prefix)
+    return PrimitiveMatch(
+        kind=base.kind,
+        via=f"{base.anchor}.{last_attr}",
+        target_node=arg_node,
+        target_value=target,
+        extra_targets=extras,
+        dynamic=is_dyn,
+        target_type=t_type,
+        receiver=base.receiver or root.id,
+        data_format=opts.data_format,
+        mode=opts.mode,
+        options=opts.options,
+        raw_expr=raw_expr,
+    )
+
+
+def _format_receiver(root: ast.expr, attrs: list[str], idx: int) -> str:
+    """Formata o texto do objeto receptor antes da âncora `.read`/`.write`.
+
+    Args:
+        root: Nó raiz da cadeia.
+        attrs: Lista de atributos da cadeia.
+        idx: Índice da âncora `.read`/`.write`.
+
+    Returns:
+        Expressão textual do receptor.
+    """
+    root_text = ast.unparse(root)
+    return root_text if idx == 0 else f"{root_text}.{'.'.join(attrs[:idx])}"
+
+
+def _build_anchored_match(
+    root: ast.expr,
+    steps: list[ChainStep],
+    anchor: str,
+    kind: IoKind,
+    env: EnvScope,
+    env_prefix: str,
+) -> PrimitiveMatch:
+    """Constrói um `PrimitiveMatch` a partir de uma cadeia ancorada em `.read`/`.write`.
+
+    Args:
+        root: Nó raiz da cadeia.
+        steps: Passos da cadeia desenrolada.
+        anchor: Nome da âncora encontrada (`"read"`, `"write"`, etc.).
+        kind: Direção (`"read"` ou `"write"`).
+        env: Escopo simbólico atual.
+        env_prefix: Prefixo padrão de ambiente (`pr`).
+
+    Returns:
+        Instância preenchida de `PrimitiveMatch`.
+    """
+    attrs = [s.attr for s in steps]
+    idx = attrs.index(anchor)
+    last_step = steps[-1]
+    opts = _collect_chain_options(steps[idx + 1 :], env)
+    arg_node = _extract_call_arg(last_step.call) if last_step.call is not None else None
+    target, extras, is_dyn, t_type, raw_expr = _resolve_target_and_type(arg_node, last_step.attr, opts, env, env_prefix)
+    return PrimitiveMatch(
+        kind=kind,
+        via=f"{anchor}.{last_step.attr}",
+        target_node=arg_node,
+        target_value=target,
+        extra_targets=extras,
+        dynamic=is_dyn,
+        target_type=t_type,
+        receiver=_format_receiver(root, attrs, idx),
+        data_format=opts.data_format,
+        mode=opts.mode,
+        options=opts.options,
+        raw_expr=raw_expr,
+    )
 
 
 def _match_read_or_write_chain(
@@ -276,7 +483,7 @@ def _match_read_or_write_chain(
     env: EnvScope,
     env_prefix: str,
 ) -> PrimitiveMatch | None:
-    """Detecta cadeias `*.read.*`, `*.readStream.*`, `*.write.*` e `*.writeStream.*`.
+    """Detecta cadeias `*.read.*`, `*.readStream.*`, `*.write.*`, `*.writeStream.*` e builders.
 
     Args:
         root: Nó raiz da cadeia.
@@ -287,39 +494,15 @@ def _match_read_or_write_chain(
     Returns:
         `PrimitiveMatch` correspondente ou `None`.
     """
-    if not steps or steps[-1].call is None:
-        return None
-    last_call = steps[-1].call
-    last_attr = steps[-1].attr
-    attrs = [s.attr for s in steps]
+    builder_hit = _match_builder_terminal(root, steps, env, env_prefix)
+    if builder_hit is not None or not steps or steps[-1].call is None:
+        return builder_hit
 
-    for anchor, kind, terminals in (
-        ("read", "read", _READ_TERMINALS),
-        ("readStream", "read", _READ_TERMINALS),
-        ("write", "write", _WRITE_TERMINALS),
-        ("writeStream", "write", _WRITE_TERMINALS),
-    ):
-        if anchor not in attrs or last_attr not in terminals:
-            continue
-        idx = attrs.index(anchor)
-        opts = _collect_chain_options(steps[idx + 1 :], env)
-        arg_node = _extract_call_arg(last_call)
-        target, is_dyn, t_type, raw_expr = _resolve_target_and_type(arg_node, last_attr, opts, env, env_prefix)
-        root_text = ast.unparse(root)
-        receiver = root_text if idx == 0 else f"{root_text}.{'.'.join(attrs[:idx])}"
-        return PrimitiveMatch(
-            kind=kind,
-            via=f"{anchor}.{last_attr}",
-            target_node=arg_node,
-            target_value=target,
-            dynamic=is_dyn,
-            target_type=t_type,
-            receiver=receiver,
-            data_format=opts.data_format,
-            mode=opts.mode,
-            options=opts.options,
-            raw_expr=raw_expr,
-        )
+    attrs = [s.attr for s in steps]
+    last_attr = steps[-1].attr
+    for anchor, kind, terminals in _ANCHOR_SPECS:
+        if anchor in attrs and last_attr in terminals:
+            return _build_anchored_match(root, steps, anchor, kind, env, env_prefix)
     return None
 
 

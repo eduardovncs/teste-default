@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from spark_io.models import IoKind
+
 WILDCARD = "<*>"
 _IDENT_RE = re.compile(r"^(?:<\*>|[A-Za-z_][A-Za-z0-9_]*|<\*>_[A-Za-z0-9_]+|[A-Za-z0-9_]+_<\*>)$")
 _NUMERIC_ONLY_RE = re.compile(r"^\d+$")
@@ -31,6 +33,27 @@ class FuncSummary:
     passthrough_param_name: str | None = None
 
 
+@dataclass(frozen=True)
+class BuilderState:
+    """Estado acumulado de um DataFrameReader/DataFrameWriter em variável intermediária.
+
+    Args:
+        kind: Direção do builder (`"read"` ou `"write"`).
+        anchor: Nome da âncora original (`"read"`, `"readStream"`, `"write"` ou `"writeStream"`).
+        receiver: Expressão do objeto raiz que originou o builder.
+        data_format: Formato acumulado via `.format(...)`.
+        mode: Modo de escrita acumulado via `.mode(...)`.
+        options: Opções acumuladas via `.option(...)` / `.options(...)`.
+    """
+
+    kind: IoKind
+    anchor: str
+    receiver: str | None = None
+    data_format: str | None = None
+    mode: str | None = None
+    options: dict[str, str] = field(default_factory=dict)
+
+
 @dataclass
 class EnvScope:
     """Mini-ambiente simbólico de constantes literais conhecidas no escopo atual.
@@ -42,6 +65,9 @@ class EnvScope:
         widgets: Valores de `dbutils.widgets.get(...)` injetados por `dbutils.notebook.run`.
         user_vars: Variáveis fornecidas explicitamente pelo chamador (têm precedência sobre `<*>`).
         delta_tables: Mapeamento de variáveis `DeltaTable` para `(target, dynamic, raw_expr)`.
+        builders: Variáveis que armazenam `DataFrameReader` / `DataFrameWriter` intermediários.
+        imported_symbols: Símbolos importados localmente (`alias -> (modulo, nome_original)`).
+        imported_modules: Módulos locais importados (`alias -> modulo`).
         env_prefix: Prefixo padrão de ambiente (`pr`) usado como fallback em dicts por ambiente.
         func_summaries: Resumos estáticos de funções auxiliares do repositório.
     """
@@ -52,6 +78,9 @@ class EnvScope:
     widgets: dict[str, str] = field(default_factory=dict)
     user_vars: dict[str, str] = field(default_factory=dict)
     delta_tables: dict[str, tuple[str, bool, str | None]] = field(default_factory=dict)
+    builders: dict[str, BuilderState] = field(default_factory=dict)
+    imported_symbols: dict[str, tuple[str, str]] = field(default_factory=dict)
+    imported_modules: dict[str, str] = field(default_factory=dict)
     env_prefix: str = ""
     func_summaries: dict[str, FuncSummary] = field(default_factory=dict)
 
@@ -68,6 +97,9 @@ class EnvScope:
             widgets=dict(self.widgets),
             user_vars=dict(self.user_vars),
             delta_tables=dict(self.delta_tables),
+            builders=dict(self.builders),
+            imported_symbols=dict(self.imported_symbols),
+            imported_modules=dict(self.imported_modules),
             env_prefix=self.env_prefix,
             func_summaries=self.func_summaries,
         )

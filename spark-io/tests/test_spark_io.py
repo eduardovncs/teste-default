@@ -548,3 +548,138 @@ def test_nested_dict_falls_back_to_env_prefix_when_env_helper_is_opaque(tmp_path
     assert [e.target for e in res.outputs] == ["pr_xpt.gsal_gold.tfinal"]
     assert res.outputs[0].via == "wrapper:write_hive"
     assert res.unresolved_dynamic == []
+
+
+# --------------------------------------------------------------------------- #
+# 9. Cobertura total (return, classes, builders, imports locais e safety net)
+# --------------------------------------------------------------------------- #
+
+
+def test_captures_reads_and_writes_in_return_class_async_and_while(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "oop_job.py",
+        """
+        def carregar_direto():
+            return conector.read.table("pr_xpto.xpto_ing.tb_return")
+
+        async def carregar_async():
+            return conector.table("pr_xpto.xpto_ing.tb_async")
+
+        class PipelineCompe:
+            def executar(self):
+                df = self.spark.read.table("pr_xpto.xpto_ing.tb_class")
+                while tem_lote:
+                    extra = self.spark.read.parquet("/mnt/raw/while_in")
+                df.write.mode("overwrite").saveAsTable("pr_xpto.gold.tb_class_out")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="oop_job.py", env_prefix="pr")
+
+    assert {
+        "pr_xpto.xpto_ing.tb_return",
+        "pr_xpto.xpto_ing.tb_async",
+        "pr_xpto.xpto_ing.tb_class",
+        "/mnt/raw/while_in",
+    } <= {e.target for e in res.inputs}
+    assert "pr_xpto.gold.tb_class_out" in {e.target for e in res.outputs}
+
+
+def test_captures_multiline_reader_and_writer_builders(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "builders.py",
+        """
+        reader = conector.read.format("parquet").option("header", "true")
+        reader = reader.option("path", "/mnt/raw/builder_opt")
+        df1 = reader.load()
+
+        r2 = conector.read.format("delta")
+        df2 = r2.table("pr_xpto.xpto_ing.tb_builder")
+
+        writer = df1.write.format("delta").mode("overwrite").option("overwriteSchema", "true")
+        writer.saveAsTable("pr_xpto.gold.tb_writer_out")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="builders.py", env_prefix="pr")
+
+    assert {"/mnt/raw/builder_opt", "pr_xpto.xpto_ing.tb_builder"} <= {e.target for e in res.inputs}
+    out_by_target = {e.target: e for e in res.outputs}
+    assert "pr_xpto.gold.tb_writer_out" in out_by_target
+    assert out_by_target["pr_xpto.gold.tb_writer_out"].mode == "overwrite"
+    assert out_by_target["pr_xpto.gold.tb_writer_out"].options.get("overwriteSchema") == "true"
+
+
+def test_follows_imported_local_functions_called_from_entrypoint(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/etapa.py",
+        """
+        SCHEMA = "xpto_ing"
+
+        def rodar(spark):
+            df = spark.read.table(f"{env}_xpto.{SCHEMA}.tb_modulo")
+            df.write.saveAsTable("pr_xpto.gold.tb_modulo_out")
+
+        def funcao_nao_chamada(spark):
+            return spark.read.table("pr_xpto.xpto_ing.tb_morta")
+        """,
+    )
+    _write(
+        tmp_path,
+        "entrypoint.py",
+        """
+        from src.etapa import rodar
+
+        rodar(conector)
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="entrypoint.py", env_prefix="pr")
+
+    assert {e.target for e in res.inputs} == {"pr_xpto.xpto_ing.tb_modulo"}
+    assert {e.target for e in res.outputs} == {"pr_xpto.gold.tb_modulo_out"}
+
+
+def test_captures_list_of_paths_and_fixed_tables_inside_wrappers(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        def ler_com_dim(spark, tbl):
+            dim = spark.table("pr_xpto.xpto_ing.tb_dim_fixa")
+            return spark.table(tbl).join(dim, "cbco")
+
+        df_paths = conector.read.parquet(["/mnt/raw/p1", "/mnt/raw/p2"])
+        df_fato = ler_com_dim(conector, "pr_xpto.xpto_ing.tb_fato")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    assert {
+        "/mnt/raw/p1",
+        "/mnt/raw/p2",
+        "pr_xpto.xpto_ing.tb_fato",
+        "pr_xpto.xpto_ing.tb_dim_fixa",
+    } <= {e.target for e in res.inputs}
+
+
+def test_safety_net_never_silently_drops_exotic_spark_read_or_write(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "exotico.py",
+        """
+        dfs = [conector.read.load(p) for p in listar_caminhos_externos()]
+        leitor = lambda nome: conector.table(nome)
+        conector.sql(montar_query_dinamica())
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="exotico.py", env_prefix="pr")
+
+    unresolved_lines = {u.line for u in res.unresolved_dynamic}
+    assert {1, 2, 3} <= unresolved_lines
+    assert all(u.kind == "read" for u in res.unresolved_dynamic if u.line in {1, 2, 3})

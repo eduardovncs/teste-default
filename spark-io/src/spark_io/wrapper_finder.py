@@ -22,12 +22,16 @@ class InternalWrapper:
         default_mode: Modo de escrita literal padrão observado dentro do wrapper.
         default_format: Formato de dados literal observado dentro do wrapper.
         default_options: Opções literais observadas dentro do wrapper.
+        param_io_lines: Linhas dentro do wrapper cujas chamadas dependem do parâmetro.
+        fn_node: Nó `ast.FunctionDef` original para inspeção de tabelas fixas internas.
     """
 
     info: WrapperInfo
     default_mode: str | None = None
     default_format: str | None = None
     default_options: dict[str, str] = field(default_factory=dict)
+    param_io_lines: frozenset[int] = frozenset()
+    fn_node: ast.FunctionDef | None = None
 
 
 @dataclass(frozen=True)
@@ -54,14 +58,16 @@ class _WrapperAccum:
     default_mode: str | None = None
     default_format: str | None = None
     default_options: dict[str, str] = field(default_factory=dict)
+    param_io_lines: set[int] = field(default_factory=set)
 
-    def add_primitive(self, prim: PrimitiveMatch, p_name: str, p_idx: int) -> None:
+    def add_primitive(self, prim: PrimitiveMatch, p_name: str, p_idx: int, line: int) -> None:
         """Registra evidência oriunda de uma primitiva Spark/Delta.
 
         Args:
             prim: Primitiva Spark/Delta encontrada dentro da função.
             p_name: Nome do parâmetro da função propagado como alvo.
             p_idx: Índice posicional do parâmetro propagado como alvo.
+            line: Linha da chamada parametrizada dentro do wrapper.
         """
         self.kinds.add(prim.kind)
         self.wraps.append(prim.via)
@@ -69,14 +75,16 @@ class _WrapperAccum:
         self.default_mode = self.default_mode or prim.mode
         self.default_format = self.default_format or prim.data_format
         self.default_options.update(prim.options)
+        self.param_io_lines.add(line)
 
-    def add_inner_wrapper(self, inner: InternalWrapper, p_name: str, p_idx: int) -> None:
+    def add_inner_wrapper(self, inner: InternalWrapper, p_name: str, p_idx: int, line: int) -> None:
         """Registra evidência oriunda de uma chamada a outro wrapper já descoberto.
 
         Args:
             inner: Wrapper interno invocado pela função.
             p_name: Nome do parâmetro da função propagado como alvo.
             p_idx: Índice posicional do parâmetro propagado como alvo.
+            line: Linha da chamada parametrizada dentro do wrapper.
         """
         inner_kind: IoKind = "write" if inner.info.kind == "write" else "read"
         self.kinds.add(inner_kind)
@@ -85,6 +93,7 @@ class _WrapperAccum:
         self.default_mode = self.default_mode or inner.default_mode
         self.default_format = self.default_format or inner.default_format
         self.default_options.update(inner.default_options)
+        self.param_io_lines.add(line)
 
 
 def _param_index_map(fn: ast.FunctionDef) -> dict[str, int]:
@@ -363,13 +372,13 @@ def _record_call_in_accum(call: ast.Call, ictx: _InspectCtx, accum: _WrapperAccu
     if prim is not None:
         origin = _propagate_origin(prim.target_node, ictx.lineage, ictx.summaries)
         if origin is not None:
-            accum.add_primitive(prim, origin[0], origin[1])
+            accum.add_primitive(prim, origin[0], origin[1], call.lineno)
         return
 
     wrapped = _match_known_wrapper_call(call, ictx.known, ictx.lineage, ictx.summaries)
     if wrapped is not None:
         inner, p_name, p_idx = wrapped
-        accum.add_inner_wrapper(inner, p_name, p_idx)
+        accum.add_inner_wrapper(inner, p_name, p_idx, call.lineno)
 
 
 def _inspect_function_body(
@@ -418,6 +427,8 @@ def _inspect_function_body(
         default_mode=accum.default_mode,
         default_format=accum.default_format,
         default_options=accum.default_options,
+        param_io_lines=frozenset(accum.param_io_lines),
+        fn_node=fn,
     )
 
 

@@ -10,6 +10,7 @@ from pathlib import Path
 from spark_io.chain_analyzer import (
     NotebookRunMatch,
     PrimitiveMatch,
+    extract_builder_state,
     extract_delta_binding_from_steps,
     match_notebook_run_call,
     match_spark_primitive,
@@ -37,6 +38,7 @@ from spark_io.partial_eval import (
     eval_str_list,
     is_table_pattern,
 )
+from spark_io.safety_net import audit_missed_io
 from spark_io.source_loader import ParsedDocument, load_document
 from spark_io.sql_extractor import extract_sql_io
 from spark_io.wrapper_finder import InternalWrapper, ModuleAst, discover_func_summaries, discover_wrappers
@@ -98,8 +100,24 @@ class _MapperContext:
     wrappers: dict[str, InternalWrapper] = field(default_factory=dict)
     func_summaries: dict[str, FuncSummary] = field(default_factory=dict)
     visited_files: set[Path] = field(default_factory=set)
+    visited_symbols: set[tuple[Path, str]] = field(default_factory=set)
+    analyzed_wrappers: set[str] = field(default_factory=set)
+    covered_lines: dict[str, set[int]] = field(default_factory=dict)
     seen_io: set[tuple[str, str, str, int]] = field(default_factory=set)
     seen_refs: set[tuple[str, str, str, int]] = field(default_factory=set)
+    seen_unresolved: set[tuple[str, int, str]] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _ResolvedWrapper:
+    """Especificação unificada de wrapper interno ou customizado."""
+
+    kind: IoKind
+    param_idx: int | None
+    param_name: str | None
+    default_mode: str | None
+    default_format: str | None
+    default_options: dict[str, str]
 
 
 def _new_env(ctx: _MapperContext, *, widgets: dict[str, str] | None = None) -> EnvScope:
@@ -120,16 +138,30 @@ def _new_env(ctx: _MapperContext, *, widgets: dict[str, str] | None = None) -> E
     )
 
 
-@dataclass(frozen=True)
-class _ResolvedWrapper:
-    """Especificação unificada de wrapper interno ou customizado."""
+def _mark_covered(ctx: _MapperContext, rel_file: str, line: int) -> None:
+    """Marca uma linha de arquivo como já contabilizada pela Camada 1.
 
-    kind: IoKind
-    param_idx: int | None
-    param_name: str | None
-    default_mode: str | None
-    default_format: str | None
-    default_options: dict[str, str]
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        rel_file: Caminho relativo do arquivo.
+        line: Número da linha (1-based).
+    """
+    ctx.covered_lines.setdefault(rel_file, set()).add(line)
+
+
+def _record_unresolved(ctx: _MapperContext, item: UnresolvedDynamic) -> None:
+    """Registra uma expressão dinâmica não resolvida sem duplicar por `(file, line, kind)`.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        item: Instância de `UnresolvedDynamic`.
+    """
+    key = (item.file, item.line, item.kind)
+    if key in ctx.seen_unresolved:
+        return
+    ctx.seen_unresolved.add(key)
+    _mark_covered(ctx, item.file, item.line)
+    ctx.result.unresolved_dynamic.append(item)
 
 
 def _rel_str(root: Path, file_path: Path) -> str:
@@ -311,6 +343,7 @@ def _record_io(ctx: _MapperContext, entry: IoEntry) -> None:
         ctx: Contexto compartilhado do mapeador.
         entry: Entrada de I/O a adicionar.
     """
+    _mark_covered(ctx, entry.file, entry.line)
     key = (entry.kind, entry.target, entry.file, entry.line)
     if key in ctx.seen_io:
         return
@@ -335,6 +368,7 @@ def _record_sql_block(
         line: Linha inicial do bloco SQL.
         temp_views: Conjunto mutável de temp views conhecidas no escopo atual.
     """
+    _mark_covered(ctx, rel_file, line)
     extracted = extract_sql_io(sql, env_prefix=ctx.env_prefix, temp_views=temp_views)
     temp_views.update(extracted.created_temp_views)
     ctx.result.warnings.extend(extracted.warnings)
@@ -392,8 +426,8 @@ def _copy_env_subset(src: EnvScope, dst: EnvScope, names: set[str] | None) -> No
             dst.lists[key] = list(val)
 
 
-def _handle_import_stmt(ctx: _MapperContext, stmt: ast.ImportFrom, env: EnvScope) -> None:
-    """Carrega constantes literais de `from mod import a, b` quando `mod` é local.
+def _handle_import_from(ctx: _MapperContext, stmt: ast.ImportFrom, env: EnvScope) -> None:
+    """Carrega constantes e registra símbolos importados de módulos locais.
 
     Args:
         ctx: Contexto compartilhado do mapeador.
@@ -410,6 +444,24 @@ def _handle_import_stmt(ctx: _MapperContext, stmt: ast.ImportFrom, env: EnvScope
         return
     wanted = None if any(a.name == "*" for a in stmt.names) else {a.name for a in stmt.names}
     _copy_env_subset(_collect_module_env(ctx, tree), env, wanted)
+    for alias in stmt.names:
+        if alias.name != "*":
+            local_name = alias.asname or alias.name
+            env.imported_symbols[local_name] = (stmt.module, alias.name)
+
+
+def _handle_plain_import(ctx: _MapperContext, stmt: ast.Import, env: EnvScope) -> None:
+    """Registra módulos locais importados via `import mod [as alias]`.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        stmt: Declaração `ast.Import`.
+        env: Escopo simbólico destino.
+    """
+    for alias in stmt.names:
+        if _resolve_import_module(ctx.project_root, alias.name) is not None:
+            local_name = alias.asname or alias.name
+            env.imported_modules[local_name] = alias.name
 
 
 def _handle_primitive_match(
@@ -427,33 +479,35 @@ def _handle_primitive_match(
         line: Linha da chamada.
     """
     if prim.target_value == WILDCARD:
-        ctx.result.unresolved_dynamic.append(
+        _record_unresolved(
+            ctx,
             UnresolvedDynamic(
                 file=rel_file,
                 line=line,
                 call=prim.via,
                 kind=prim.kind,
                 expr=prim.raw_expr or WILDCARD,
-            )
+            ),
         )
         return
-    _record_io(
-        ctx,
-        IoEntry(
-            target=prim.target_value,
-            kind=prim.kind,
-            via=prim.via,
-            file=rel_file,
-            line=line,
-            receiver=prim.receiver,
-            data_format=prim.data_format,
-            mode=prim.mode,
-            options=dict(prim.options),
-            target_type=prim.target_type,
-            dynamic=prim.dynamic,
-            raw_expr=prim.raw_expr,
-        ),
-    )
+    for target in (prim.target_value, *prim.extra_targets):
+        _record_io(
+            ctx,
+            IoEntry(
+                target=target,
+                kind=prim.kind,
+                via=prim.via,
+                file=rel_file,
+                line=line,
+                receiver=prim.receiver,
+                data_format=prim.data_format,
+                mode=prim.mode,
+                options=dict(prim.options),
+                target_type=prim.target_type,
+                dynamic=(WILDCARD in target),
+                raw_expr=prim.raw_expr,
+            ),
+        )
 
 
 def _resolve_wrapper_spec(ctx: _MapperContext, callee: str) -> _ResolvedWrapper | None:
@@ -529,6 +583,26 @@ def _extract_kw_str(call: ast.Call, names: tuple[str, ...], env: EnvScope) -> st
     return None
 
 
+def _analyze_wrapper_fixed_io(ctx: _MapperContext, wrapper: InternalWrapper) -> None:
+    """Analisa uma vez o corpo de um wrapper chamado para capturar tabelas fixas internas.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        wrapper: Wrapper interno efetivamente invocado.
+    """
+    if wrapper.info.name in ctx.analyzed_wrappers or wrapper.fn_node is None:
+        return
+    ctx.analyzed_wrappers.add(wrapper.info.name)
+    wrapper_path = (ctx.project_root / wrapper.info.file).resolve()
+    _, tree = _load_and_parse(ctx, wrapper_path)
+    base_env = _collect_module_env(ctx, tree) if tree is not None else _new_env(ctx)
+    temp_views: set[str] = set()
+    for stmt in wrapper.fn_node.body:
+        if stmt.lineno in wrapper.param_io_lines:
+            continue
+        _walk_single_statement(ctx, stmt, wrapper_path, base_env, temp_views)
+
+
 def _handle_wrapper_call(
     ctx: _MapperContext,
     call: ast.Call,
@@ -552,6 +626,10 @@ def _handle_wrapper_call(
     if spec is None:
         return False
 
+    internal = ctx.wrappers.get(callee)
+    if internal is not None:
+        _analyze_wrapper_fixed_io(ctx, internal)
+
     arg_node = _pick_wrapper_arg(call, spec.param_idx, spec.param_name)
     if arg_node is None:
         return True
@@ -559,8 +637,9 @@ def _handle_wrapper_call(
     raw_expr = None if isinstance(arg_node, ast.Constant) else ast.unparse(arg_node)
 
     if resolved == WILDCARD:
-        ctx.result.unresolved_dynamic.append(
-            UnresolvedDynamic(file=rel_file, line=call.lineno, call=callee, kind=spec.kind, expr=raw_expr or WILDCARD)
+        _record_unresolved(
+            ctx,
+            UnresolvedDynamic(file=rel_file, line=call.lineno, call=callee, kind=spec.kind, expr=raw_expr or WILDCARD),
         )
         return True
 
@@ -581,6 +660,66 @@ def _handle_wrapper_call(
             raw_expr=raw_expr,
         ),
     )
+    return True
+
+
+def _resolve_imported_target(call: ast.Call, env: EnvScope) -> tuple[str, str] | None:
+    """Identifica se `call` invoca uma função/classe importada de módulo local.
+
+    Args:
+        call: Nó `ast.Call`.
+        env: Escopo simbólico atual.
+
+    Returns:
+        Tupla `(nome_modulo, nome_simbolo)` ou `None`.
+    """
+    if isinstance(call.func, ast.Name) and call.func.id in env.imported_symbols:
+        return env.imported_symbols[call.func.id]
+    if isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name):
+        mod_name = env.imported_modules.get(call.func.value.id)
+        if mod_name is not None:
+            return mod_name, call.func.attr
+    return None
+
+
+def _analyze_imported_symbol(ctx: _MapperContext, mod_name: str, sym_name: str) -> bool:
+    """Analisa estaticamente apenas a função ou classe importada de um módulo local.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        mod_name: Nome pontuado do módulo local.
+        sym_name: Nome da função ou classe invocada.
+
+    Returns:
+        `True` quando o símbolo local foi encontrado e processado.
+    """
+    mod_path = _resolve_import_module(ctx.project_root, mod_name)
+    if mod_path is None:
+        return False
+    key = (mod_path, sym_name)
+    if key in ctx.visited_symbols:
+        return True
+    _, tree = _load_and_parse(ctx, mod_path)
+    if tree is None:
+        return False
+
+    target_node = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name == sym_name
+        ),
+        None,
+    )
+    if target_node is None:
+        return False
+
+    ctx.visited_symbols.add(key)
+    mod_env = _collect_module_env(ctx, tree)
+    temp_views: set[str] = set()
+    _walk_statements(ctx, target_node.body, mod_path, mod_env, temp_views)
+    rel_mod = _rel_str(ctx.project_root, mod_path)
+    _run_safety_audit(ctx, target_node, rel_mod)
     return True
 
 
@@ -611,6 +750,7 @@ def _check_unclassified_table_ref(
         if key in ctx.seen_refs:
             continue
         ctx.seen_refs.add(key)
+        _mark_covered(ctx, rel_file, call.lineno)
         raw_expr = None if isinstance(arg, ast.Constant) else ast.unparse(arg)
         ctx.result.unclassified_table_refs.append(
             UnclassifiedTableRef(
@@ -639,14 +779,15 @@ def _handle_notebook_run(
         rel_file: Caminho relativo do arquivo chamador.
     """
     if nb_run.dynamic:
-        ctx.result.unresolved_dynamic.append(
+        _record_unresolved(
+            ctx,
             UnresolvedDynamic(
                 file=rel_file,
                 line=nb_run.line,
                 call="dbutils.notebook.run",
                 kind="dependency",
                 expr=nb_run.raw_expr,
-            )
+            ),
         )
         return
 
@@ -691,7 +832,7 @@ def _callee_name(call: ast.Call) -> str:
     return ""
 
 
-def _process_single_call(
+def _process_direct_call(
     ctx: _MapperContext,
     call: ast.Call,
     cur_file: Path,
@@ -699,7 +840,7 @@ def _process_single_call(
     env: EnvScope,
     temp_views: set[str],
 ) -> bool:
-    """Classifica uma única chamada AST (temp view, SQL, notebook.run, primitiva, wrapper ou ref).
+    """Classifica chamadas de infraestrutura Spark (temp view, SQL, notebook.run, primitiva).
 
     Args:
         ctx: Contexto compartilhado do mapeador.
@@ -710,7 +851,7 @@ def _process_single_call(
         temp_views: Conjunto mutável de temp views no escopo atual.
 
     Returns:
-        `True` se a chamada inteira foi consumida e não precisa descer nos filhos.
+        `True` se a chamada foi consumida.
     """
     view_name = match_temp_view_call(call, env)
     if view_name is not None:
@@ -731,10 +872,41 @@ def _process_single_call(
     if prim is not None:
         _handle_primitive_match(ctx, prim, rel_file, call.lineno)
         return True
+    return False
+
+
+def _process_single_call(
+    ctx: _MapperContext,
+    call: ast.Call,
+    cur_file: Path,
+    rel_file: str,
+    env: EnvScope,
+    temp_views: set[str],
+) -> bool:
+    """Classifica uma única chamada AST (Spark, wrapper, função local importada ou ref).
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        call: Nó `ast.Call`.
+        cur_file: Caminho absoluto do arquivo atual.
+        rel_file: Caminho relativo do arquivo atual.
+        env: Escopo simbólico atual.
+        temp_views: Conjunto mutável de temp views no escopo atual.
+
+    Returns:
+        `True` se a chamada inteira foi consumida e não precisa descer nos filhos.
+    """
+    if _process_direct_call(ctx, call, cur_file, rel_file, env, temp_views):
+        return True
 
     callee = _callee_name(call)
     if callee and _handle_wrapper_call(ctx, call, callee, env, rel_file):
         return True
+
+    imported = _resolve_imported_target(call, env)
+    if imported is not None and _analyze_imported_symbol(ctx, imported[0], imported[1]):
+        return True
+
     if callee:
         _check_unclassified_table_ref(ctx, call, callee, env, rel_file)
     return False
@@ -784,6 +956,36 @@ def _walk_statements(
         _walk_single_statement(ctx, stmt, cur_file, env, temp_views)
 
 
+def _walk_control_flow(
+    ctx: _MapperContext,
+    stmt: ast.stmt,
+    cur_file: Path,
+    env: EnvScope,
+    temp_views: set[str],
+) -> None:
+    """Percorre fluxos de controle (`for`, `while`, `if/else`, `with`, `try`, `match`).
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        stmt: Instrução de controle de fluxo AST.
+        cur_file: Arquivo atual.
+        env: Escopo simbólico atual.
+        temp_views: Conjunto mutável de temp views conhecidas.
+    """
+    if isinstance(stmt, ast.For):
+        _handle_for_loop(ctx, stmt, cur_file, env, temp_views)
+    elif isinstance(stmt, (ast.While, ast.If)):
+        _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
+        _walk_statements(ctx, stmt.orelse, cur_file, env.copy(), temp_views)
+    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+        _walk_statements(ctx, stmt.body, cur_file, env, temp_views)
+    elif isinstance(stmt, ast.Try):
+        _walk_try_statement(ctx, stmt, cur_file, env, temp_views)
+    elif isinstance(stmt, ast.Match):
+        for case in stmt.cases:
+            _walk_statements(ctx, case.body, cur_file, env.copy(), temp_views)
+
+
 def _walk_compound_statement(
     ctx: _MapperContext,
     stmt: ast.stmt,
@@ -791,7 +993,7 @@ def _walk_compound_statement(
     env: EnvScope,
     temp_views: set[str],
 ) -> None:
-    """Percorre instruções compostas (`for`, `if/else`, `with`, `try`, `def`).
+    """Percorre definições (`class`, `def`, `async def`) e fluxos de controle.
 
     Args:
         ctx: Contexto compartilhado do mapeador.
@@ -800,17 +1002,13 @@ def _walk_compound_statement(
         env: Escopo simbólico atual.
         temp_views: Conjunto mutável de temp views conhecidas.
     """
-    if isinstance(stmt, ast.For):
-        _handle_for_loop(ctx, stmt, cur_file, env, temp_views)
-    elif isinstance(stmt, ast.If):
+    if isinstance(stmt, ast.ClassDef):
         _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
-        _walk_statements(ctx, stmt.orelse, cur_file, env.copy(), temp_views)
-    elif isinstance(stmt, (ast.With, ast.AsyncWith)):
-        _walk_statements(ctx, stmt.body, cur_file, env, temp_views)
-    elif isinstance(stmt, ast.Try):
-        _walk_try_statement(ctx, stmt, cur_file, env, temp_views)
-    elif isinstance(stmt, ast.FunctionDef) and stmt.name not in ctx.wrappers:
-        _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
+    elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if stmt.name not in ctx.wrappers:
+            _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
+    else:
+        _walk_control_flow(ctx, stmt, cur_file, env, temp_views)
 
 
 def _walk_try_statement(
@@ -853,13 +1051,15 @@ def _walk_single_statement(
         temp_views: Conjunto mutável de temp views conhecidas.
     """
     if isinstance(stmt, ast.ImportFrom):
-        _handle_import_stmt(ctx, stmt, env)
+        _handle_import_from(ctx, stmt, env)
+    elif isinstance(stmt, ast.Import):
+        _handle_plain_import(ctx, stmt, env)
     elif isinstance(stmt, ast.Assign):
         _handle_assign(ctx, stmt, cur_file, env, temp_views)
     elif isinstance(stmt, ast.AnnAssign) and stmt.value is not None:
         bind_assignment(stmt.target, stmt.value, env)
         _inspect_expression_calls(ctx, stmt.value, cur_file, env, temp_views)
-    elif isinstance(stmt, ast.Expr):
+    elif isinstance(stmt, (ast.Expr, ast.Return)) and stmt.value is not None:
         _inspect_expression_calls(ctx, stmt.value, cur_file, env, temp_views)
     else:
         _walk_compound_statement(ctx, stmt, cur_file, env, temp_views)
@@ -872,7 +1072,7 @@ def _handle_assign(
     env: EnvScope,
     temp_views: set[str],
 ) -> None:
-    """Processa atribuição atualizando constantes, `DeltaTable` bindings e chamadas I/O.
+    """Processa atribuição atualizando constantes, `DeltaTable`, builders e chamadas I/O.
 
     Args:
         ctx: Contexto compartilhado do mapeador.
@@ -881,6 +1081,7 @@ def _handle_assign(
         env: Escopo simbólico atual.
         temp_views: Conjunto mutável de temp views conhecidas.
     """
+    rel_file = _rel_str(ctx.project_root, cur_file)
     if len(stmt.targets) == 1 and isinstance(stmt.targets[0], ast.Name):
         var_name = stmt.targets[0].id
         root, steps = unwind_chain(stmt.value)
@@ -888,6 +1089,12 @@ def _handle_assign(
         if delta_bind is not None:
             target, is_dyn, raw_expr, _, _ = delta_bind
             env.delta_tables[var_name] = (target, is_dyn, raw_expr)
+            _mark_covered(ctx, rel_file, stmt.lineno)
+            return
+        builder = extract_builder_state(stmt.value, env)
+        if builder is not None:
+            env.builders[var_name] = builder
+            _mark_covered(ctx, rel_file, stmt.lineno)
             return
         bind_assignment(stmt.targets[0], stmt.value, env)
     _inspect_expression_calls(ctx, stmt.value, cur_file, env, temp_views)
@@ -962,8 +1169,42 @@ def _process_run_directives(
         _analyze_file(ctx, target_path, env, temp_views)
 
 
+def _wrapper_ignored_lines(ctx: _MapperContext, rel_file: str) -> set[int]:
+    """Coleta linhas de chamadas parametrizadas dentro de wrappers definidos em `rel_file`.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        rel_file: Caminho relativo do arquivo auditado.
+
+    Returns:
+        Conjunto de números de linha cobertos pelos wrappers do arquivo.
+    """
+    ignored: set[int] = set()
+    for wrapper in ctx.wrappers.values():
+        if wrapper.info.file != rel_file:
+            continue
+        ignored.update(wrapper.param_io_lines)
+        if wrapper.info.name not in ctx.analyzed_wrappers and wrapper.fn_node is not None:
+            ignored.update(getattr(node, "lineno", 0) for node in ast.walk(wrapper.fn_node) if hasattr(node, "lineno"))
+    return ignored
+
+
+def _run_safety_audit(ctx: _MapperContext, node: ast.AST, rel_file: str) -> None:
+    """Executa a Camada 2 (`ast.walk`) para garantir que nenhuma leitura/escrita escape.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        node: Nó AST (módulo ou função/classe) a auditar.
+        rel_file: Caminho relativo do arquivo de origem.
+    """
+    covered = ctx.covered_lines.get(rel_file, set())
+    ignored = _wrapper_ignored_lines(ctx, rel_file)
+    for missed in audit_missed_io(node, rel_file, covered, ignored):
+        _record_unresolved(ctx, missed)
+
+
 def _analyze_file(ctx: _MapperContext, file_path: Path, env: EnvScope, temp_views: set[str]) -> None:
-    """Analisa estaticamente um único arquivo (Python, `%run` e blocos SQL).
+    """Analisa estaticamente um único arquivo (Camada 1 + Camada 2 + blocos SQL).
 
     Args:
         ctx: Contexto compartilhado do mapeador.
@@ -982,6 +1223,7 @@ def _analyze_file(ctx: _MapperContext, file_path: Path, env: EnvScope, temp_view
 
     if tree is not None:
         _walk_statements(ctx, tree.body, resolved, env, temp_views)
+        _run_safety_audit(ctx, tree, rel_file)
 
     for block in doc.sql_blocks:
         _record_sql_block(ctx, block.sql, rel_file, block.line, temp_views)
