@@ -1,4 +1,4 @@
-"""Descoberta estática de funções wrapper de I/O Spark com propagação multi-hop."""
+"""Descoberta estática de funções wrapper de I/O Spark e resumos de funções auxiliares."""
 
 from __future__ import annotations
 
@@ -7,7 +7,10 @@ from dataclasses import dataclass, field
 
 from spark_io.chain_analyzer import PrimitiveMatch, match_spark_primitive
 from spark_io.models import IoKind, WrapperInfo, WrapperKind
-from spark_io.partial_eval import EnvScope
+from spark_io.partial_eval import EnvScope, FuncSummary
+
+ParamOrigin = tuple[str, int]
+_STR_PASSTHROUGH_METHODS = frozenset({"strip", "lstrip", "rstrip", "lower", "upper"})
 
 
 @dataclass
@@ -117,19 +120,145 @@ def _default_string_params(fn: ast.FunctionDef) -> dict[str, str]:
     }
 
 
-def _param_ref(node: ast.expr | None, param_map: dict[str, int]) -> tuple[str | None, int | None]:
-    """Identifica se uma expressão referencia diretamente um parâmetro da função.
+def _iter_direct_nodes(fn: ast.FunctionDef) -> list[ast.AST]:
+    """Percorre os nós AST do corpo de `fn` sem entrar em funções aninhadas.
 
     Args:
-        node: Expressão AST do argumento passado internamente.
-        param_map: Mapa de parâmetros da função externa.
+        fn: Definição de função AST.
 
     Returns:
-        Tupla `(nome_param, indice_param)` ou `(None, None)`.
+        Lista ordenada de nós AST pertencentes diretamente a `fn`.
     """
-    if isinstance(node, ast.Name) and node.id in param_map:
-        return node.id, param_map[node.id]
-    return None, None
+    stack: list[ast.AST] = list(reversed(fn.body))
+    out: list[ast.AST] = []
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            continue
+        out.append(cur)
+        stack.extend(reversed(list(ast.iter_child_nodes(cur))))
+    return out
+
+
+def _call_origin(
+    call: ast.Call,
+    lineage: dict[str, ParamOrigin],
+    summaries: dict[str, FuncSummary],
+) -> ParamOrigin | None:
+    """Resolve se uma chamada propaga um parâmetro (`.strip()`, pass-through ou validador 1-arg).
+
+    Args:
+        call: Nó `ast.Call`.
+        lineage: Linhagem atual de variáveis locais.
+        summaries: Resumos conhecidos de funções auxiliares.
+
+    Returns:
+        `ParamOrigin` propagado ou `None`.
+    """
+    if isinstance(call.func, ast.Attribute) and call.func.attr in _STR_PASSTHROUGH_METHODS:
+        return _propagate_origin(call.func.value, lineage, summaries)
+
+    callee = _extract_callee_name(call)
+    summary = summaries.get(callee) if callee else None
+    if summary is not None:
+        if summary.constant is not None:
+            return None
+        arg = _extract_wrapper_target_arg(call, summary.passthrough_param_index, summary.passthrough_param_name)
+        return _propagate_origin(arg, lineage, summaries)
+
+    if len(call.args) == 1 and not isinstance(call.args[0], ast.Subscript):
+        return _propagate_origin(call.args[0], lineage, summaries)
+    return None
+
+
+def _unique_origin(
+    nodes: list[ast.expr],
+    lineage: dict[str, ParamOrigin],
+    summaries: dict[str, FuncSummary],
+) -> ParamOrigin | None:
+    """Retorna a única origem de parâmetro encontrada entre múltiplos nós AST.
+
+    Args:
+        nodes: Lista de expressões AST filhas.
+        lineage: Mapa de variáveis locais para `(nome_param, indice_param)`.
+        summaries: Resumos de funções auxiliares conhecidas.
+
+    Returns:
+        `ParamOrigin` único ou `None`.
+    """
+    origins = {origin for item in nodes if (origin := _propagate_origin(item, lineage, summaries)) is not None}
+    return next(iter(origins)) if len(origins) == 1 else None
+
+
+def _propagate_origin(
+    node: ast.expr | None,
+    lineage: dict[str, ParamOrigin],
+    summaries: dict[str, FuncSummary],
+) -> ParamOrigin | None:
+    """Identifica se `node` deriva diretamente de um único parâmetro (sem vazar chaves de dict).
+
+    Args:
+        node: Expressão AST inspecionada.
+        lineage: Mapa de variáveis locais para `(nome_param, indice_param)`.
+        summaries: Resumos de funções auxiliares conhecidas.
+
+    Returns:
+        Tupla `(nome_param, indice_param)` ou `None`.
+    """
+    if node is None or isinstance(node, ast.Subscript):
+        return None
+    if isinstance(node, ast.Name):
+        return lineage.get(node.id)
+    if isinstance(node, ast.Call):
+        return _call_origin(node, lineage, summaries)
+    if isinstance(node, ast.JoinedStr):
+        parts = [p.value for p in node.values if isinstance(p, ast.FormattedValue)]
+        return _unique_origin(parts, lineage, summaries)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _unique_origin([node.left, node.right], lineage, summaries)
+    return None
+
+
+def _extract_assign_pair(node: ast.AST) -> tuple[str, ast.expr] | None:
+    """Extrai `(nome_variavel, expr_valor)` de atribuições simples.
+
+    Args:
+        node: Nó AST candidato.
+
+    Returns:
+        Tupla `(nome, valor)` ou `None`.
+    """
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+        return node.targets[0].id, node.value
+    if isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name) and node.value is not None:
+        return node.target.id, node.value
+    return None
+
+
+def _build_param_lineage(
+    fn: ast.FunctionDef,
+    param_map: dict[str, int],
+    summaries: dict[str, FuncSummary],
+) -> dict[str, ParamOrigin]:
+    """Propaga variáveis locais derivadas de parâmetros (ex.: `table_fqn = _validate(table)`).
+
+    Args:
+        fn: Definição de função AST.
+        param_map: Mapa inicial de parâmetros posicionais da função.
+        summaries: Resumos de funções auxiliares já conhecidos.
+
+    Returns:
+        Dicionário `{nome_variavel: (nome_parametro, indice_parametro)}`.
+    """
+    lineage: dict[str, ParamOrigin] = {name: (name, idx) for name, idx in param_map.items()}
+    for node in _iter_direct_nodes(fn):
+        pair = _extract_assign_pair(node)
+        if pair is None:
+            continue
+        origin = _propagate_origin(pair[1], lineage, summaries)
+        if origin is not None:
+            lineage[pair[0]] = origin
+    return lineage
 
 
 def _combine_kinds(kinds: set[IoKind]) -> WrapperKind:
@@ -144,6 +273,22 @@ def _combine_kinds(kinds: set[IoKind]) -> WrapperKind:
     if "read" in kinds and "write" in kinds:
         return "read_write"
     return "write" if "write" in kinds else "read"
+
+
+def _extract_callee_name(call: ast.Call) -> str | None:
+    """Retorna o nome simples da função ou método chamado em `ast.Call`.
+
+    Args:
+        call: Nó `ast.Call`.
+
+    Returns:
+        Nome do identificador ou `None`.
+    """
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
 
 
 def _extract_wrapper_target_arg(
@@ -173,55 +318,55 @@ def _extract_wrapper_target_arg(
 def _match_known_wrapper_call(
     call: ast.Call,
     known: dict[str, InternalWrapper],
-    param_map: dict[str, int],
+    lineage: dict[str, ParamOrigin],
+    summaries: dict[str, FuncSummary],
 ) -> tuple[InternalWrapper, str, int] | None:
     """Verifica se uma chamada invoca um wrapper já conhecido propagando um parâmetro.
 
     Args:
         call: Chamada AST dentro do corpo da função candidata.
         known: Mapa de wrappers já identificados.
-        param_map: Mapa de parâmetros da função externa.
+        lineage: Linhagem de variáveis locais até os parâmetros da função externa.
+        summaries: Resumos de funções auxiliares conhecidas.
 
     Returns:
         Tupla `(wrapper_interno, nome_param, indice_param)` ou `None`.
     """
-    callee = (
-        call.func.id
-        if isinstance(call.func, ast.Name)
-        else (call.func.attr if isinstance(call.func, ast.Attribute) else None)
-    )
+    callee = _extract_callee_name(call)
     if callee is None or callee not in known:
         return None
     inner = known[callee]
     arg_node = _extract_wrapper_target_arg(call, inner.info.target_param_index, inner.info.target_param)
-    p_name, p_idx = _param_ref(arg_node, param_map)
-    return None if p_name is None or p_idx is None else (inner, p_name, p_idx)
+    origin = _propagate_origin(arg_node, lineage, summaries)
+    return None if origin is None else (inner, origin[0], origin[1])
 
 
-def _record_call_in_accum(
-    call: ast.Call,
-    env: EnvScope,
-    param_map: dict[str, int],
-    known: dict[str, InternalWrapper],
-    accum: _WrapperAccum,
-) -> None:
+@dataclass(frozen=True)
+class _InspectCtx:
+    """Contexto de inspeção de chamadas dentro de uma função candidata a wrapper."""
+
+    env: EnvScope
+    lineage: dict[str, ParamOrigin]
+    known: dict[str, InternalWrapper]
+    summaries: dict[str, FuncSummary]
+
+
+def _record_call_in_accum(call: ast.Call, ictx: _InspectCtx, accum: _WrapperAccum) -> None:
     """Avalia uma chamada dentro do corpo de uma função e atualiza o acumulador.
 
     Args:
         call: Nó `ast.Call` inspecionado.
-        env: Escopo simbólico local da função.
-        param_map: Mapa de parâmetros da função.
-        known: Wrappers já identificados.
+        ictx: Contexto de inspeção da função candidata.
         accum: Acumulador de evidências.
     """
-    prim = match_spark_primitive(call, env, env_prefix="")
+    prim = match_spark_primitive(call, ictx.env, env_prefix="")
     if prim is not None:
-        p_name, p_idx = _param_ref(prim.target_node, param_map)
-        if p_name is not None and p_idx is not None:
-            accum.add_primitive(prim, p_name, p_idx)
+        origin = _propagate_origin(prim.target_node, ictx.lineage, ictx.summaries)
+        if origin is not None:
+            accum.add_primitive(prim, origin[0], origin[1])
         return
 
-    wrapped = _match_known_wrapper_call(call, known, param_map)
+    wrapped = _match_known_wrapper_call(call, ictx.known, ictx.lineage, ictx.summaries)
     if wrapped is not None:
         inner, p_name, p_idx = wrapped
         accum.add_inner_wrapper(inner, p_name, p_idx)
@@ -231,6 +376,7 @@ def _inspect_function_body(
     fn: ast.FunctionDef,
     rel_path: str,
     known: dict[str, InternalWrapper],
+    summaries: dict[str, FuncSummary],
 ) -> InternalWrapper | None:
     """Verifica se uma função encapsula primitivas Spark ou wrappers já conhecidos.
 
@@ -238,17 +384,23 @@ def _inspect_function_body(
         fn: Nó `ast.FunctionDef` a inspecionar.
         rel_path: Caminho relativo do arquivo onde a função está definida.
         known: Mapa de wrappers já descobertos até a iteração atual.
+        summaries: Resumos de funções auxiliares puras.
 
     Returns:
         `InternalWrapper` quando a função encapsula I/O, ou `None`.
     """
-    param_map = _param_index_map(fn)
-    env = EnvScope(strings=_default_string_params(fn))
+    lineage = _build_param_lineage(fn, _param_index_map(fn), summaries)
+    ictx = _InspectCtx(
+        env=EnvScope(strings=_default_string_params(fn)),
+        lineage=lineage,
+        known=known,
+        summaries=summaries,
+    )
     accum = _WrapperAccum()
 
-    for node in ast.walk(fn):
+    for node in _iter_direct_nodes(fn):
         if isinstance(node, ast.Call):
-            _record_call_in_accum(node, env, param_map, known, accum)
+            _record_call_in_accum(node, ictx, accum)
 
     if not accum.kinds:
         return None
@@ -269,15 +421,21 @@ def _inspect_function_body(
     )
 
 
-def discover_wrappers(modules: list[ModuleAst]) -> dict[str, InternalWrapper]:
+def discover_wrappers(
+    modules: list[ModuleAst],
+    *,
+    func_summaries: dict[str, FuncSummary] | None = None,
+) -> dict[str, InternalWrapper]:
     """Descobre todos os wrappers internos em um conjunto de módulos (ponto fixo multi-hop).
 
     Args:
         modules: Lista de módulos Python já parseados.
+        func_summaries: Resumos opcionais de funções puras já descobertos.
 
     Returns:
         Dicionário `{nome_funcao: InternalWrapper}` com todos os wrappers identificados.
     """
+    summaries = func_summaries or {}
     functions: list[tuple[str, ast.FunctionDef]] = [
         (mod.rel_path, node) for mod in modules for node in ast.walk(mod.tree) if isinstance(node, ast.FunctionDef)
     ]
@@ -288,10 +446,78 @@ def discover_wrappers(modules: list[ModuleAst]) -> dict[str, InternalWrapper]:
         for rel_path, fn in functions:
             if fn.name in known:
                 continue
-            found = _inspect_function_body(fn, rel_path, known)
+            found = _inspect_function_body(fn, rel_path, known, summaries)
             if found is not None:
                 known[fn.name] = found
                 changed = True
         if not changed:
             break
     return known
+
+
+def _constant_return_value(return_vals: list[ast.expr]) -> str | None:
+    """Retorna a string constante se todos os `return` da função devolverem o mesmo literal.
+
+    Args:
+        return_vals: Expressões retornadas pela função.
+
+    Returns:
+        String literal única ou `None`.
+    """
+    values: set[str] = set()
+    for expr in return_vals:
+        if not (isinstance(expr, ast.Constant) and isinstance(expr.value, str)):
+            return None
+        values.add(expr.value)
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _summarize_function(fn: ast.FunctionDef) -> FuncSummary | None:
+    """Resume uma função pura quando retorna string constante ou propaga um parâmetro.
+
+    Args:
+        fn: Definição de função AST.
+
+    Returns:
+        `FuncSummary` quando constante ou pass-through, ou `None`.
+    """
+    return_vals = [n.value for n in _iter_direct_nodes(fn) if isinstance(n, ast.Return) and n.value is not None]
+    if not return_vals:
+        return None
+
+    const_val = _constant_return_value(return_vals)
+    if const_val is not None:
+        return FuncSummary(constant=const_val)
+
+    lineage = _build_param_lineage(fn, _param_index_map(fn), {})
+    origins = {_propagate_origin(v, lineage, {}) for v in return_vals}
+    origin = next(iter(origins)) if len(origins) == 1 else None
+    if origin is None:
+        return None
+    return FuncSummary(passthrough_param_name=origin[0], passthrough_param_index=origin[1])
+
+
+def discover_func_summaries(
+    modules: list[ModuleAst],
+    *,
+    exclude: set[str] | None = None,
+) -> dict[str, FuncSummary]:
+    """Descobre funções puras de retorno constante ou pass-through nos módulos alcançáveis.
+
+    Args:
+        modules: Lista de módulos Python já parseados.
+        exclude: Nomes de funções a ignorar (ex.: wrappers de I/O já classificados).
+
+    Returns:
+        Dicionário `{nome_funcao: FuncSummary}`.
+    """
+    ignored = exclude or set()
+    summaries: dict[str, FuncSummary] = {}
+    for mod in modules:
+        for node in ast.walk(mod.tree):
+            if not isinstance(node, ast.FunctionDef) or node.name in ignored:
+                continue
+            summary = _summarize_function(node)
+            if summary is not None:
+                summaries[node.name] = summary
+    return summaries

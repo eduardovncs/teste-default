@@ -464,3 +464,87 @@ def test_cli_outputs_valid_json(tmp_path: Path, capsys: pytest.CaptureFixture[st
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
     assert any(item["target"] == "pr_xpto.xpto_ing.tb_cli" for item in payload["inputs"])
+
+
+# --------------------------------------------------------------------------- #
+# 8. Dicionários aninhados, helpers pass-through/constantes e wrappers indiretos
+# --------------------------------------------------------------------------- #
+
+
+def test_resolves_nested_dict_passthrough_helper_and_indirect_wrapper(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "sample.py",
+        """
+        input_Tables = {
+            "pr": {"tabela_gsal": "pr_xpt.gsal_ing.tcredt"},
+            "ex": {"tabela_gsal": "ex_xpt.gsal_ing.tcredt"},
+        }
+
+        def _validate_fqn(table):
+            return table
+
+        def enviroment_of_cluster(spark):
+            return "pr"
+
+        def hive_get_table(spark, table):
+            table_fqn = _validate_fqn(table)
+            return spark.table(table_fqn)
+
+        def main(spark):
+            env = enviroment_of_cluster(spark)
+            t_gsal = _validate_fqn(input_Tables[env]["tabela_gsal"])
+            df = hive_get_table(spark, t_gsal)
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="sample.py", env_prefix="pr")
+
+    assert [e.target for e in res.inputs] == ["pr_xpt.gsal_ing.tcredt"]
+    assert res.inputs[0].via == "wrapper:hive_get_table"
+    assert not res.inputs[0].dynamic
+    assert any(
+        w.name == "hive_get_table" and w.target_param == "table" and w.target_param_index == 1 for w in res.wrappers
+    )
+
+
+def test_nested_dict_falls_back_to_env_prefix_when_env_helper_is_opaque(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "cfg.py",
+        """
+        TABLES = {
+            "pr": {"gsal": "pr_xpt.gsal_ing.tcredt", "out": "pr_xpt.gsal_gold.tfinal"},
+            "dv": {"gsal": "dv_xpt.gsal_ing.tcredt", "out": "dv_xpt.gsal_gold.tfinal"},
+        }
+        """,
+    )
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        from cfg import TABLES
+        from lib_ext import get_cluster_env
+
+        def _clean(name):
+            return name.strip()
+
+        def write_hive(df, target):
+            fqn = _clean(target)
+            df.write.mode("overwrite").saveAsTable(fqn)
+
+        def run(spark):
+            env = get_cluster_env(spark)
+            src = _clean(TABLES[env]["gsal"])
+            dst = _clean(TABLES[env]["out"])
+            df = spark.table(src)
+            write_hive(df, dst)
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    assert [e.target for e in res.inputs] == ["pr_xpt.gsal_ing.tcredt"]
+    assert [e.target for e in res.outputs] == ["pr_xpt.gsal_gold.tfinal"]
+    assert res.outputs[0].via == "wrapper:write_hive"
+    assert res.unresolved_dynamic == []

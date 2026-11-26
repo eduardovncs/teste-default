@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import copy
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -29,6 +30,7 @@ from spark_io.models import (
 from spark_io.partial_eval import (
     WILDCARD,
     EnvScope,
+    FuncSummary,
     apply_env_prefix,
     bind_assignment,
     eval_str_expr,
@@ -37,7 +39,7 @@ from spark_io.partial_eval import (
 )
 from spark_io.source_loader import ParsedDocument, load_document
 from spark_io.sql_extractor import extract_sql_io
-from spark_io.wrapper_finder import InternalWrapper, ModuleAst, discover_wrappers
+from spark_io.wrapper_finder import InternalWrapper, ModuleAst, discover_func_summaries, discover_wrappers
 
 _SUPPORTED_SUFFIXES = frozenset({".py", ".ipynb", ".sql"})
 _IGNORED_DIRS = frozenset({".venv", ".git", "__pycache__", ".pytest_cache", ".ruff_cache", "node_modules"})
@@ -94,9 +96,28 @@ class _MapperContext:
     docs: dict[Path, ParsedDocument] = field(default_factory=dict)
     trees: dict[Path, ast.Module] = field(default_factory=dict)
     wrappers: dict[str, InternalWrapper] = field(default_factory=dict)
+    func_summaries: dict[str, FuncSummary] = field(default_factory=dict)
     visited_files: set[Path] = field(default_factory=set)
     seen_io: set[tuple[str, str, str, int]] = field(default_factory=set)
     seen_refs: set[tuple[str, str, str, int]] = field(default_factory=set)
+
+
+def _new_env(ctx: _MapperContext, *, widgets: dict[str, str] | None = None) -> EnvScope:
+    """Cria um novo `EnvScope` herdando variáveis, prefixo de ambiente e resumos de funções.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        widgets: Argumentos opcionais de widgets injetados por `dbutils.notebook.run`.
+
+    Returns:
+        Nova instância configurada de `EnvScope`.
+    """
+    return EnvScope(
+        widgets=dict(widgets or {}),
+        user_vars=dict(ctx.user_vars),
+        env_prefix=ctx.env_prefix,
+        func_summaries=ctx.func_summaries,
+    )
 
 
 @dataclass(frozen=True)
@@ -333,17 +354,17 @@ def _record_sql_block(
         )
 
 
-def _collect_module_env(tree: ast.Module, user_vars: dict[str, str]) -> EnvScope:
+def _collect_module_env(ctx: _MapperContext, tree: ast.Module) -> EnvScope:
     """Extrai constantes literais de nível superior de um módulo Python.
 
     Args:
+        ctx: Contexto compartilhado do mapeador.
         tree: AST do módulo.
-        user_vars: Variáveis fornecidas pelo chamador.
 
     Returns:
         `EnvScope` contendo constantes literais do módulo.
     """
-    mod_env = EnvScope(user_vars=user_vars)
+    mod_env = _new_env(ctx)
     for stmt in tree.body:
         if isinstance(stmt, ast.Assign) and len(stmt.targets) == 1:
             bind_assignment(stmt.targets[0], stmt.value, mod_env)
@@ -365,7 +386,7 @@ def _copy_env_subset(src: EnvScope, dst: EnvScope, names: set[str] | None) -> No
             dst.strings[key] = val
     for key, val in src.dicts.items():
         if names is None or key in names:
-            dst.dicts[key] = dict(val)
+            dst.dicts[key] = copy.deepcopy(val)
     for key, val in src.lists.items():
         if names is None or key in names:
             dst.lists[key] = list(val)
@@ -388,7 +409,7 @@ def _handle_import_stmt(ctx: _MapperContext, stmt: ast.ImportFrom, env: EnvScope
     if tree is None:
         return
     wanted = None if any(a.name == "*" for a in stmt.names) else {a.name for a in stmt.names}
-    _copy_env_subset(_collect_module_env(tree, ctx.user_vars), env, wanted)
+    _copy_env_subset(_collect_module_env(ctx, tree), env, wanted)
 
 
 def _handle_primitive_match(
@@ -579,7 +600,7 @@ def _check_unclassified_table_ref(
         env: Escopo simbólico atual.
         rel_file: Caminho relativo do arquivo atual.
     """
-    if callee in _IGNORED_CALL_NAMES:
+    if callee in _IGNORED_CALL_NAMES or callee in ctx.func_summaries:
         return
     call_name = ast.unparse(call.func)
     for arg in (*call.args, *(kw.value for kw in call.keywords)):
@@ -650,7 +671,7 @@ def _handle_notebook_run(
             arguments=dict(nb_run.arguments),
         )
     )
-    child_env = EnvScope(widgets=dict(nb_run.arguments), user_vars=dict(ctx.user_vars))
+    child_env = _new_env(ctx, widgets=nb_run.arguments)
     _analyze_file(ctx, target_path, child_env, temp_views=set())
 
 
@@ -1043,10 +1064,12 @@ def map_spark_io(
     )
 
     reachable_modules = _collect_reachable_modules(ctx, start_files)
-    ctx.wrappers = discover_wrappers(reachable_modules)
+    raw_summaries = discover_func_summaries(reachable_modules)
+    ctx.wrappers = discover_wrappers(reachable_modules, func_summaries=raw_summaries)
+    ctx.func_summaries = {k: v for k, v in raw_summaries.items() if k not in ctx.wrappers}
     ctx.result.wrappers = [w.info for w in ctx.wrappers.values()]
 
     for start_file in start_files:
-        _analyze_file(ctx, start_file, EnvScope(user_vars=dict(ctx.user_vars)), temp_views=set())
+        _analyze_file(ctx, start_file, _new_env(ctx), temp_views=set())
 
     return ctx.result

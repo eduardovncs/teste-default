@@ -3,14 +3,32 @@
 from __future__ import annotations
 
 import ast
+import copy
 import re
 from dataclasses import dataclass, field
+from typing import Any
 
 WILDCARD = "<*>"
 _IDENT_RE = re.compile(r"^(?:<\*>|[A-Za-z_][A-Za-z0-9_]*|<\*>_[A-Za-z0-9_]+|[A-Za-z0-9_]+_<\*>)$")
 _NUMERIC_ONLY_RE = re.compile(r"^\d+$")
 _SQL_ENV_PREFIX_RE = re.compile(r"<\*>_([A-Za-z0-9_]+(?:\.[A-Za-z0-9_<>]+)+)")
 _FORBIDDEN_TABLE_CHARS = frozenset({" ", "\t", "\n", "/", "\\", ":"})
+_STR_METHODS = frozenset({"strip", "lstrip", "rstrip", "lower", "upper"})
+
+
+@dataclass(frozen=True)
+class FuncSummary:
+    """Resumo estático de uma função auxiliar pura (retorno constante ou pass-through).
+
+    Args:
+        constant: String literal constante retornada pela função, quando aplicável.
+        passthrough_param_index: Índice posicional do parâmetro retornado intacto/sanitizado.
+        passthrough_param_name: Nome do parâmetro retornado intacto/sanitizado.
+    """
+
+    constant: str | None = None
+    passthrough_param_index: int | None = None
+    passthrough_param_name: str | None = None
 
 
 @dataclass
@@ -19,33 +37,39 @@ class EnvScope:
 
     Args:
         strings: Variáveis resolvidas para string literal ou template com `<*>`.
-        dicts: Dicionários literais de strings (`nome_var -> {chave: valor}`).
+        dicts: Dicionários literais (planos ou aninhados) acessíveis por chave.
         lists: Listas ou tuplas literais de strings (`nome_var -> [itens]`).
         widgets: Valores de `dbutils.widgets.get(...)` injetados por `dbutils.notebook.run`.
         user_vars: Variáveis fornecidas explicitamente pelo chamador (têm precedência sobre `<*>`).
         delta_tables: Mapeamento de variáveis `DeltaTable` para `(target, dynamic, raw_expr)`.
+        env_prefix: Prefixo padrão de ambiente (`pr`) usado como fallback em dicts por ambiente.
+        func_summaries: Resumos estáticos de funções auxiliares do repositório.
     """
 
     strings: dict[str, str] = field(default_factory=dict)
-    dicts: dict[str, dict[str, str]] = field(default_factory=dict)
+    dicts: dict[str, dict[str, Any]] = field(default_factory=dict)
     lists: dict[str, list[str]] = field(default_factory=dict)
     widgets: dict[str, str] = field(default_factory=dict)
     user_vars: dict[str, str] = field(default_factory=dict)
     delta_tables: dict[str, tuple[str, bool, str | None]] = field(default_factory=dict)
+    env_prefix: str = ""
+    func_summaries: dict[str, FuncSummary] = field(default_factory=dict)
 
     def copy(self) -> EnvScope:
-        """Cria uma cópia rasa independente do escopo atual.
+        """Cria uma cópia independente do escopo atual.
 
         Returns:
-            Nova instância de `EnvScope` com dicionários copiados.
+            Nova instância de `EnvScope` com estruturas mutáveis copiadas.
         """
         return EnvScope(
             strings=dict(self.strings),
-            dicts={k: dict(v) for k, v in self.dicts.items()},
+            dicts=copy.deepcopy(self.dicts),
             lists={k: list(v) for k, v in self.lists.items()},
             widgets=dict(self.widgets),
             user_vars=dict(self.user_vars),
             delta_tables=dict(self.delta_tables),
+            env_prefix=self.env_prefix,
+            func_summaries=self.func_summaries,
         )
 
 
@@ -151,8 +175,81 @@ def _eval_widget_get(call: ast.Call, env: EnvScope) -> str | None:
     return env.widgets.get(key, env.user_vars.get(key, WILDCARD))
 
 
+def _eval_str_method(call: ast.Call, env: EnvScope) -> str | None:
+    """Avalia métodos simples de normalização de string (`.strip`, `.lower`, `.upper`).
+
+    Args:
+        call: Nó `ast.Call` candidato.
+        env: Escopo simbólico atual.
+
+    Returns:
+        String transformada ou `None` quando não for método suportado.
+    """
+    if not isinstance(call.func, ast.Attribute) or call.func.attr not in _STR_METHODS:
+        return None
+    base = eval_str_expr(call.func.value, env)
+    if base == WILDCARD:
+        return WILDCARD
+    method = getattr(base, call.func.attr)
+    return str(method())
+
+
+def _simple_callee_name(call: ast.Call) -> str | None:
+    """Extrai o nome simples de uma função ou método invocado em `ast.Call`.
+
+    Args:
+        call: Nó `ast.Call`.
+
+    Returns:
+        Identificador simples ou `None`.
+    """
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _pick_summary_arg(call: ast.Call, summary: FuncSummary) -> ast.expr | None:
+    """Seleciona o argumento propagado por uma função pass-through.
+
+    Args:
+        call: Chamada AST da função auxiliar.
+        summary: Resumo estático da função.
+
+    Returns:
+        Nó AST do argumento propagado ou `None`.
+    """
+    if summary.passthrough_param_name:
+        for kw in call.keywords:
+            if kw.arg == summary.passthrough_param_name:
+                return kw.value
+    idx = summary.passthrough_param_index
+    return call.args[idx] if idx is not None and len(call.args) > idx else None
+
+
+def _eval_summary_call(call: ast.Call, env: EnvScope) -> str | None:
+    """Resolve chamadas a funções auxiliares puras registradas em `env.func_summaries`.
+
+    Args:
+        call: Nó `ast.Call` candidato.
+        env: Escopo simbólico atual.
+
+    Returns:
+        Valor resolvido pela função auxiliar ou `None` quando não registrada.
+    """
+    callee = _simple_callee_name(call)
+    summary = env.func_summaries.get(callee) if callee else None
+    if summary is None:
+        return None
+    if summary.constant is not None:
+        return summary.constant
+    arg_node = _pick_summary_arg(call, summary)
+    return eval_str_expr(arg_node, env) if arg_node is not None else WILDCARD
+
+
 def _eval_call_expr(node: ast.Call, env: EnvScope) -> str:
-    """Avalia chamadas suportadas em expressões de string (`widgets.get` e `.format`).
+    """Avalia chamadas suportadas em expressões de string (`widgets.get`, `.format`, helpers).
 
     Args:
         node: Nó `ast.Call`.
@@ -161,9 +258,10 @@ def _eval_call_expr(node: ast.Call, env: EnvScope) -> str:
     Returns:
         String parcialmente avaliada ou `<*>`.
     """
-    widget_val = _eval_widget_get(node, env)
-    if widget_val is not None:
-        return widget_val
+    for evaluator in (_eval_widget_get, _eval_str_method, _eval_summary_call):
+        resolved = evaluator(node, env)
+        if resolved is not None:
+            return resolved
     if isinstance(node.func, ast.Attribute) and node.func.attr == "format":
         return _eval_format_call(node, env)
     return WILDCARD
@@ -186,21 +284,62 @@ def _eval_fstring_part(part: ast.expr, env: EnvScope) -> str:
     return ""
 
 
+def _lookup_dict_key(mapping: dict[str, Any], key: str, env_prefix: str) -> Any:
+    """Busca `key` em `mapping`, usando `env_prefix` como fallback quando `key` é dinâmico.
+
+    Args:
+        mapping: Dicionário avaliado estaticamente.
+        key: Chave avaliada parcialmente.
+        env_prefix: Prefixo padrão de ambiente (`pr`).
+
+    Returns:
+        Valor encontrado no dicionário ou `None`.
+    """
+    if WILDCARD not in key:
+        return mapping.get(key)
+    if not env_prefix:
+        return None
+    if env_prefix in mapping:
+        return mapping[env_prefix]
+    lower_prefix = env_prefix.lower()
+    for map_key, map_val in mapping.items():
+        if map_key.lower() == lower_prefix:
+            return map_val
+    return None
+
+
+def _eval_container_expr(node: ast.expr, env: EnvScope) -> Any:
+    """Resolve acessos recursivos em dicionários aninhados (ex.: `TABLES[env]["gsal"]`).
+
+    Args:
+        node: Expressão AST de nome ou subscript.
+        env: Escopo simbólico atual.
+
+    Returns:
+        String, dicionário aninhado, lista ou `None`.
+    """
+    if isinstance(node, ast.Name):
+        return env.dicts.get(node.id, env.lists.get(node.id, env.strings.get(node.id)))
+    if isinstance(node, ast.Subscript):
+        container = _eval_container_expr(node.value, env)
+        if isinstance(container, dict):
+            key = eval_str_expr(node.slice, env)
+            return _lookup_dict_key(container, key, env.env_prefix)
+    return None
+
+
 def _eval_subscript(node: ast.Subscript, env: EnvScope) -> str:
-    """Avalia acessos literais `CFG["chave"]` em dicionários conhecidos no escopo.
+    """Avalia acessos em dicionários literais (planos ou aninhados) no escopo.
 
     Args:
         node: Nó `ast.Subscript`.
         env: Escopo simbólico atual.
 
     Returns:
-        Valor resolvido do dicionário ou `<*>`.
+        String resolvida ou `<*>`.
     """
-    if isinstance(node.value, ast.Name) and node.value.id in env.dicts:
-        key = eval_str_expr(node.slice, env)
-        if WILDCARD not in key:
-            return env.dicts[node.value.id].get(key, WILDCARD)
-    return WILDCARD
+    val = _eval_container_expr(node, env)
+    return val if isinstance(val, str) else WILDCARD
 
 
 def _eval_composite_str(node: ast.expr, env: EnvScope) -> str:
@@ -258,8 +397,49 @@ def eval_str_list(node: ast.expr, env: EnvScope) -> list[str] | None:
     return None
 
 
+def _eval_dict_value(node: ast.expr, env: EnvScope) -> Any:
+    """Avalia um valor de dicionário suportando dicts aninhados, listas ou strings.
+
+    Args:
+        node: Expressão AST de valor no dicionário.
+        env: Escopo simbólico atual.
+
+    Returns:
+        Dicionário aninhado, lista ou string parcialmente avaliada.
+    """
+    nested = eval_nested_dict(node, env)
+    if nested is not None:
+        return nested
+    list_val = eval_str_list(node, env)
+    return list_val if list_val is not None else eval_str_expr(node, env)
+
+
+def eval_nested_dict(node: ast.expr, env: EnvScope) -> dict[str, Any] | None:
+    """Resolve um dicionário literal (plano ou aninhado) para estrutura Python.
+
+    Args:
+        node: Expressão AST candidata a dicionário.
+        env: Escopo simbólico atual.
+
+    Returns:
+        Dicionário resolvido ou `None` quando não for um dicionário conhecido.
+    """
+    if isinstance(node, ast.Name) and node.id in env.dicts:
+        return copy.deepcopy(env.dicts[node.id])
+    if not isinstance(node, ast.Dict):
+        return None
+    out: dict[str, Any] = {}
+    for key_node, val_node in zip(node.keys, node.values, strict=False):
+        if key_node is None:
+            continue
+        key = eval_str_expr(key_node, env)
+        if WILDCARD not in key:
+            out[key] = _eval_dict_value(val_node, env)
+    return out
+
+
 def eval_str_dict(node: ast.expr, env: EnvScope) -> dict[str, str] | None:
-    """Resolve um dicionário literal `{chave: valor}` para pares de strings.
+    """Resolve um dicionário plano `{chave: valor}` para pares de strings.
 
     Args:
         node: Expressão AST candidata a dicionário.
@@ -268,18 +448,10 @@ def eval_str_dict(node: ast.expr, env: EnvScope) -> dict[str, str] | None:
     Returns:
         Dicionário de strings ou `None` se não for um dicionário literal.
     """
-    if isinstance(node, ast.Name) and node.id in env.dicts:
-        return dict(env.dicts[node.id])
-    if not isinstance(node, ast.Dict):
+    nested = eval_nested_dict(node, env)
+    if nested is None:
         return None
-    out: dict[str, str] = {}
-    for key_node, val_node in zip(node.keys, node.values, strict=False):
-        if key_node is None:
-            continue
-        key = eval_str_expr(key_node, env)
-        if WILDCARD not in key:
-            out[key] = eval_str_expr(val_node, env)
-    return out
+    return {k: v for k, v in nested.items() if isinstance(v, str)}
 
 
 def bind_assignment(target: ast.expr, value: ast.expr, env: EnvScope) -> None:
@@ -294,7 +466,7 @@ def bind_assignment(target: ast.expr, value: ast.expr, env: EnvScope) -> None:
         return
     name = target.id
 
-    dict_val = eval_str_dict(value, env)
+    dict_val = eval_nested_dict(value, env)
     if dict_val is not None:
         env.dicts[name] = dict_val
         return
