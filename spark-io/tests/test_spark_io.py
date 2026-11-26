@@ -843,3 +843,32 @@ def test_resolves_star_import_and_package_reexport(tmp_path: Path) -> None:
     assert {e.target for e in res.inputs} == {"pr_x.xpto_ing.x"}
     assert res.unclassified_table_refs == []
     assert res.unresolved_dynamic == []
+
+
+def test_captures_write_text_and_xml_terminals(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "write_text_job.py",
+        """
+        OUTPUT_PATH = "/tmp/spark_io_write/BASTAO_BOOK"
+
+        def reproduce_write_text(spark):
+            files = ["a.txt", "b.txt"]
+            bastao_df = spark.createDataFrame([(name,) for name in files], ["list_of_files_mov"])
+            bastao_df.coalesce(1).write.mode("overwrite").text(OUTPUT_PATH)
+            xml_df = spark.read.xml("/mnt/raw/in.xml")
+            xml_df.write.mode("append").xml("/mnt/out/out.xml")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="write_text_job.py", env_prefix="pr")
+
+    expected_bastao = "/tmp/spark_io_write/BASTAO_BOOK"  # noqa: S108
+    assert {e.target for e in res.inputs} == {"/mnt/raw/in.xml"}
+    out_by_target = {e.target: e for e in res.outputs}
+    assert set(out_by_target) == {expected_bastao, "/mnt/out/out.xml"}
+    bastao = out_by_target[expected_bastao]
+    assert bastao.via == "write.text"
+    assert bastao.mode == "overwrite"
+    assert bastao.target_type == "path"
+    assert res.unresolved_dynamic == []

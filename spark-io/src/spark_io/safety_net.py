@@ -4,19 +4,15 @@ from __future__ import annotations
 
 import ast
 
-from spark_io.chain_analyzer import unwind_chain
+from spark_io.chain_analyzer import READ_TERMINALS, WRITE_TERMINALS, unwind_chain
 from spark_io.models import UnresolvedDynamic, UnresolvedKind
 
-_READ_TERMINALS = frozenset({"table", "load", "parquet", "csv", "json", "orc", "delta", "jdbc", "text"})
-_WRITE_TERMINALS = frozenset(
-    {"saveAsTable", "insertInto", "save", "parquet", "csv", "json", "orc", "delta", "jdbc", "toTable", "start"}
-)
 _DIRECT_WRITE_METHODS = frozenset({"writeTo", "mergeInto", "saveAsTable", "insertInto", "toTable"})
 _ANCHOR_RULES: tuple[tuple[str, UnresolvedKind, frozenset[str]], ...] = (
-    ("read", "read", _READ_TERMINALS),
-    ("readStream", "read", _READ_TERMINALS),
-    ("write", "write", _WRITE_TERMINALS),
-    ("writeStream", "write", _WRITE_TERMINALS),
+    ("read", "read", READ_TERMINALS),
+    ("readStream", "read", READ_TERMINALS),
+    ("write", "write", WRITE_TERMINALS),
+    ("writeStream", "write", WRITE_TERMINALS),
 )
 
 

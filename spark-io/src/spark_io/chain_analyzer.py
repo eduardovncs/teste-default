@@ -16,9 +16,23 @@ from spark_io.partial_eval import (
     eval_str_list,
 )
 
-_READ_TERMINALS = frozenset({"table", "load", "parquet", "csv", "json", "orc", "delta", "jdbc", "text"})
-_WRITE_TERMINALS = frozenset(
-    {"saveAsTable", "insertInto", "save", "parquet", "csv", "json", "orc", "delta", "jdbc", "toTable", "start"}
+READ_TERMINALS = frozenset({"table", "load", "parquet", "csv", "json", "orc", "delta", "jdbc", "text", "xml"})
+WRITE_TERMINALS = frozenset(
+    {
+        "saveAsTable",
+        "insertInto",
+        "save",
+        "parquet",
+        "csv",
+        "json",
+        "orc",
+        "delta",
+        "jdbc",
+        "text",
+        "xml",
+        "toTable",
+        "start",
+    }
 )
 _TABLE_TERMINALS = frozenset({"table", "saveAsTable", "insertInto", "toTable"})
 _WRITE_TO_TERMINALS = frozenset({"create", "append", "overwrite", "overwritePartitions", "replace", "createOrReplace"})
@@ -26,10 +40,10 @@ _DELTA_WRITE_METHODS = frozenset({"merge", "update", "delete"})
 _TEMP_VIEW_METHODS = frozenset({"createOrReplaceTempView", "createTempView", "createGlobalTempView"})
 _TARGET_KWARGS = ("path", "name", "tableName", "table")
 _ANCHOR_SPECS: tuple[tuple[str, IoKind, frozenset[str]], ...] = (
-    ("read", "read", _READ_TERMINALS),
-    ("readStream", "read", _READ_TERMINALS),
-    ("write", "write", _WRITE_TERMINALS),
-    ("writeStream", "write", _WRITE_TERMINALS),
+    ("read", "read", READ_TERMINALS),
+    ("readStream", "read", READ_TERMINALS),
+    ("write", "write", WRITE_TERMINALS),
+    ("writeStream", "write", WRITE_TERMINALS),
 )
 
 
@@ -273,7 +287,7 @@ def extract_builder_state(expr: ast.expr, env: EnvScope) -> BuilderState | None:
 
     if isinstance(root, ast.Name) and root.id in env.builders:
         base = env.builders[root.id]
-        terminals = _READ_TERMINALS if base.kind == "read" else _WRITE_TERMINALS
+        terminals = READ_TERMINALS if base.kind == "read" else WRITE_TERMINALS
         if steps[-1].call is not None and last_attr in terminals:
             return None
         merged = _merge_builder_opts(base, _collect_chain_options(steps, env))
@@ -396,7 +410,7 @@ def _match_builder_terminal(
     if not isinstance(root, ast.Name) or root.id not in env.builders or not steps or steps[-1].call is None:
         return None
     base = env.builders[root.id]
-    terminals = _READ_TERMINALS if base.kind == "read" else _WRITE_TERMINALS
+    terminals = READ_TERMINALS if base.kind == "read" else WRITE_TERMINALS
     last_attr = steps[-1].attr
     if last_attr not in terminals:
         return None
