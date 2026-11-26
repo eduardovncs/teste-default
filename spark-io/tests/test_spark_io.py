@@ -1,0 +1,466 @@
+"""Testes TDD da Fase 1 — mapeamento estático de entradas e saídas Spark."""
+
+from __future__ import annotations
+
+import json
+import textwrap
+from pathlib import Path
+
+import pytest
+
+from spark_io import CustomWrapperSpec, map_spark_io
+from spark_io.cli import main as cli_main
+
+
+def _write(base: Path, rel: str, content: str) -> Path:
+    file_path = base / rel
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(textwrap.dedent(content).lstrip("\n"), encoding="utf-8")
+    return file_path
+
+
+def _write_ipynb(base: Path, rel: str, cells: list[str]) -> Path:
+    nb = {
+        "cells": [
+            {"cell_type": "code", "execution_count": None, "metadata": {}, "outputs": [], "source": c.splitlines(True)}
+            for c in cells
+        ],
+        "metadata": {},
+        "nbformat": 4,
+        "nbformat_minor": 5,
+    }
+    return _write(base, rel, json.dumps(nb, ensure_ascii=False, indent=2))
+
+
+# --------------------------------------------------------------------------- #
+# 1. Primitivas Spark/Delta (qualquer receiver, sem depender do nome `spark`)
+# --------------------------------------------------------------------------- #
+
+
+def test_maps_spark_reads_and_writes_on_arbitrary_receivers(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        df1 = conector.read.table("pr_xpto.xpto_ing.tb_clientes")
+        df2 = self.spark.read.format("delta").option("path", "/mnt/raw/pagamentos").load()
+        df3 = sessao.read.parquet("/mnt/raw/ext")
+        df4 = conector.table("pr_xpto.xpto_ing.tb_bancos")
+        df_out = df1.join(df4, "cbco")
+        df_out.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("pr_xpto.gold.tb_saida")
+        df_out.write.format("parquet").mode("append").option("path", "/mnt/out/arqs").save()
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py")
+
+    input_targets = {e.target for e in res.inputs}
+    assert {
+        "pr_xpto.xpto_ing.tb_clientes",
+        "/mnt/raw/pagamentos",
+        "/mnt/raw/ext",
+        "pr_xpto.xpto_ing.tb_bancos",
+    } <= input_targets
+
+    out_by_target = {e.target: e for e in res.outputs}
+    assert "pr_xpto.gold.tb_saida" in out_by_target
+    assert out_by_target["pr_xpto.gold.tb_saida"].mode == "overwrite"
+    assert out_by_target["pr_xpto.gold.tb_saida"].options.get("overwriteSchema") == "true"
+    assert "/mnt/out/arqs" in out_by_target
+    assert out_by_target["/mnt/out/arqs"].mode == "append"
+    assert out_by_target["/mnt/out/arqs"].target_type == "path"
+
+
+def test_maps_delta_table_write_to_merge_into_and_streaming(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "delta_job.py",
+        """
+        from delta.tables import DeltaTable
+
+        src = conector.readStream.table("pr_xpto.xpto_ing.stream_in")
+        src.writeStream.toTable("pr_xpto.gold.stream_out")
+        src.writeTo("pr_xpto.gold.tb_v2").overwritePartitions()
+        src.mergeInto("pr_xpto.gold.tb_merge_v4", "a.id = b.id").whenMatched().updateAll().merge()
+
+        dt = DeltaTable.forName(conector, "pr_xpto.gold.tb_delta_alvo")
+        dt.alias("t").merge(src.alias("s"), "t.id = s.id").whenMatchedUpdateAll().execute()
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="delta_job.py")
+
+    assert "pr_xpto.xpto_ing.stream_in" in {e.target for e in res.inputs}
+    output_targets = {e.target for e in res.outputs}
+    assert {
+        "pr_xpto.gold.stream_out",
+        "pr_xpto.gold.tb_v2",
+        "pr_xpto.gold.tb_merge_v4",
+        "pr_xpto.gold.tb_delta_alvo",
+    } <= output_targets
+
+
+# --------------------------------------------------------------------------- #
+# 2. Avaliação parcial no AST (agnóstica ao nome de variável + env_prefix=pr)
+# --------------------------------------------------------------------------- #
+
+
+def test_resolves_user_example_wrapper_and_dynamic_env_prefix(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "src/lib.py",
+        """
+        def ler_tabela(nome_tabela):
+            return conector.read.table(nome_tabela)
+        """,
+    )
+    _write(
+        tmp_path,
+        "src/ambiente.py",
+        """
+        def get_env():
+            return os.getenv("AMBIENTE_EXECUCAO")
+        """,
+    )
+    _write(
+        tmp_path,
+        "main.py",
+        """
+        from src.lib import ler_tabela
+        from src import ambiente
+
+        env = ambiente.get_env()
+        tabela = "xpto"
+        df = ler_tabela(f"{env}_xpto.xpto_ing.{tabela}")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="main.py", env_prefix="pr")
+
+    assert any(e.target == "pr_xpto.xpto_ing.xpto" and not e.dynamic for e in res.inputs)
+    assert any(w.name.endswith("ler_tabela") and w.kind == "read" for w in res.wrappers)
+
+
+def test_env_prefix_is_agnostic_to_variable_and_call_names(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        sigla = descobrir_ambiente()
+        df1 = conector.read.table(f"{sigla}_fin.fin_ing.tb_a")
+        df2 = conector.read.table(f"{obter_prefixo()}_cred.cred_ing.tb_b")
+        df3 = conector.read.table(f"{cfg['amb']}_core.core_ing.tb_c")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    input_targets = {e.target for e in res.inputs}
+    assert {
+        "pr_fin.fin_ing.tb_a",
+        "pr_cred.cred_ing.tb_b",
+        "pr_core.core_ing.tb_c",
+    } <= input_targets
+    assert all(not e.dynamic for e in res.inputs)
+
+
+def test_partial_evaluation_preserves_wildcard_when_whole_catalog_is_dynamic_or_uses_vars(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        cat = obter_catalogo()
+        df = conector.read.table(f"{cat}.xpto_ing.tb_contas")
+        """,
+    )
+
+    res_partial = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+    assert any(e.target == "<*>.xpto_ing.tb_contas" and e.dynamic for e in res_partial.inputs)
+
+    res_with_var = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr", variables={"cat": "pr_core"})
+    assert any(e.target == "pr_core.xpto_ing.tb_contas" and not e.dynamic for e in res_with_var.inputs)
+
+
+def test_partial_evaluation_handles_concat_format_dicts_loops_and_if_else(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        PREFIXO = "pr_xpto"
+        CFG = {"origem": "pr_xpto.xpto_ing.tb_dict"}
+        TABELAS = ["tb_l1", "tb_l2"]
+
+        df_dict = conector.read.table(CFG["origem"])
+        df_concat = conector.read.table(PREFIXO + ".xpto_ing.tb_concat")
+        df_fmt = conector.read.table("{}.xpto_ing.tb_fmt".format(PREFIXO))
+
+        for t in TABELAS:
+            conector.read.table(f"{amb}_xpto.xpto_ing.{t}")
+
+        if modo == "REPROC":
+            df_dict.write.saveAsTable("pr_xpto.gold.tb_reproc")
+        else:
+            df_dict.write.saveAsTable("pr_xpto.gold.tb_normal")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    assert {
+        "pr_xpto.xpto_ing.tb_dict",
+        "pr_xpto.xpto_ing.tb_concat",
+        "pr_xpto.xpto_ing.tb_fmt",
+        "pr_xpto.xpto_ing.tb_l1",
+        "pr_xpto.xpto_ing.tb_l2",
+    } <= {e.target for e in res.inputs}
+    assert {"pr_xpto.gold.tb_reproc", "pr_xpto.gold.tb_normal"} <= {e.target for e in res.outputs}
+
+
+# --------------------------------------------------------------------------- #
+# 3. Wrappers multi-hop, externos desconhecidos e expressões opacas
+# --------------------------------------------------------------------------- #
+
+
+def test_propagates_multihop_wrappers_and_handles_external_or_opaque_calls(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "utils/raw.py",
+        """
+        def ler_raw(tbl):
+            return conector.read.table(tbl)
+        """,
+    )
+    _write(
+        tmp_path,
+        "utils/io.py",
+        """
+        from utils.raw import ler_raw
+
+        def ler_camada(nome):
+            return ler_raw(nome)
+        """,
+    )
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        from utils.io import ler_camada
+        from pacote_externo import ler_base, carregar_custom
+
+        df1 = ler_camada("pr_xpto.xpto_ing.tb_multihop")
+        df2 = ler_base("pr_xpto.xpto_ing.tb_externa")
+        df3 = carregar_custom("pr_xpto.xpto_ing.tb_custom")
+        df4 = conector.read.table(obter_nome_do_mongo())
+        """,
+    )
+
+    res = map_spark_io(
+        tmp_path,
+        entrypoint="job.py",
+        custom_wrappers={"carregar_custom": CustomWrapperSpec(kind="read")},
+    )
+
+    input_targets = {e.target for e in res.inputs}
+    assert "pr_xpto.xpto_ing.tb_multihop" in input_targets
+    assert "pr_xpto.xpto_ing.tb_custom" in input_targets
+
+    assert any(r.call == "ler_base" and r.target == "pr_xpto.xpto_ing.tb_externa" for r in res.unclassified_table_refs)
+    assert any(u.kind == "read" and "obter_nome_do_mongo" in u.expr for u in res.unresolved_dynamic)
+
+
+# --------------------------------------------------------------------------- #
+# 4. Dependências de notebooks (%run, ciclos, dbutils.notebook.run + widgets)
+# --------------------------------------------------------------------------- #
+
+
+def test_resolves_percent_run_scope_sharing_and_avoids_cycles(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "utils/helpers.py",
+        """
+        # Databricks notebook source
+        SCHEMA_ING = "xpto_ing"
+
+        def ler_com_conector(tbl):
+            return conector.read.table(tbl)
+        """,
+    )
+    _write(
+        tmp_path,
+        "nb_a.py",
+        """
+        # Databricks notebook source
+        # MAGIC %run ./utils/helpers
+        # COMMAND ----------
+        # MAGIC %run ./nb_b
+        # COMMAND ----------
+        df = ler_com_conector(f"{env}_xpto.{SCHEMA_ING}.tb_via_run")
+        """,
+    )
+    _write(
+        tmp_path,
+        "nb_b.py",
+        """
+        # Databricks notebook source
+        # MAGIC %run ./nb_a
+        # COMMAND ----------
+        conector.read.table("pr_xpto.xpto_ing.tb_do_nb_b")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="nb_a.py", env_prefix="pr")
+
+    input_targets = {e.target for e in res.inputs}
+    assert "pr_xpto.xpto_ing.tb_via_run" in input_targets
+    assert "pr_xpto.xpto_ing.tb_do_nb_b" in input_targets
+    assert any(d.via == "%run" and d.target_file.endswith("utils/helpers.py") for d in res.dependencies)
+
+
+def test_resolves_dbutils_notebook_run_widgets_and_external_workspace_paths(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "filho.py",
+        """
+        # Databricks notebook source
+        tbl = dbutils.widgets.get("tabela")
+        df = conector.read.table(f"{amb}_xpto.xpto_ing.{tbl}")
+        df.write.saveAsTable("pr_xpto.gold.tb_filho_out")
+        """,
+    )
+    _write(
+        tmp_path,
+        "orquestrador.py",
+        """
+        # Databricks notebook source
+        # MAGIC %run /Shared/corp/funcoes_globais
+        # COMMAND ----------
+        dbutils.notebook.run("./filho", 600, {"tabela": "tb_widget"})
+        dbutils.notebook.run("/Repos/outro_time/pipeline_ext", 600)
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="orquestrador.py", env_prefix="pr")
+
+    assert "pr_xpto.xpto_ing.tb_widget" in {e.target for e in res.inputs}
+    assert "pr_xpto.gold.tb_filho_out" in {e.target for e in res.outputs}
+    assert any(d.via == "dbutils.notebook.run" and d.arguments.get("tabela") == "tb_widget" for d in res.dependencies)
+    ext_paths = {(e.via, e.target_path) for e in res.external_dependencies}
+    assert ("%run", "/Shared/corp/funcoes_globais") in ext_paths
+    assert ("dbutils.notebook.run", "/Repos/outro_time/pipeline_ext") in ext_paths
+
+
+# --------------------------------------------------------------------------- #
+# 5. Múltiplos formatos (.py Databricks, .ipynb, .sql) e SQL via sqlglot
+# --------------------------------------------------------------------------- #
+
+
+def test_parses_databricks_magic_sql_ipynb_and_pure_sql_files(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "nb_databricks.py",
+        """
+        # Databricks notebook source
+        # MAGIC %md
+        # MAGIC # Título do notebook
+        # COMMAND ----------
+        # MAGIC %sql
+        # MAGIC CREATE OR REPLACE TABLE pr_xpto.gold.tb_magic_out AS
+        # MAGIC SELECT * FROM pr_xpto.xpto_ing.tb_magic_in
+        # COMMAND ----------
+        conector.sql(f"INSERT INTO {env}_xpto.gold.tb_fstr_out SELECT * FROM {env}_xpto.xpto_ing.tb_fstr_in")
+        """,
+    )
+    _write_ipynb(
+        tmp_path,
+        "nb_jupyter.ipynb",
+        [
+            'df = conector.read.table("pr_xpto.xpto_ing.tb_ipynb_py")',
+            (
+                "%%sql\n"
+                "MERGE INTO pr_xpto.gold.tb_ipynb_merge t\n"
+                "USING pr_xpto.xpto_ing.tb_ipynb_src s\n"
+                "ON t.id = s.id\n"
+                "WHEN MATCHED THEN UPDATE SET t.cbco = s.cbco"
+            ),
+        ],
+    )
+    _write(
+        tmp_path,
+        "pipeline.sql",
+        """
+        /* Comentário de bloco */
+        WITH base AS (
+            SELECT id, '-- não é comentário' AS txt
+            FROM pr_xpto.xpto_ing.tb_sql_src
+        )
+        INSERT OVERWRITE TABLE pr_xpto.gold.tb_sql_dst
+        SELECT id, txt FROM base;
+        """,
+    )
+
+    res = map_spark_io(tmp_path, env_prefix="pr")
+
+    input_targets = {e.target for e in res.inputs}
+    output_targets = {e.target for e in res.outputs}
+    assert {
+        "pr_xpto.xpto_ing.tb_magic_in",
+        "pr_xpto.xpto_ing.tb_fstr_in",
+        "pr_xpto.xpto_ing.tb_ipynb_py",
+        "pr_xpto.xpto_ing.tb_ipynb_src",
+        "pr_xpto.xpto_ing.tb_sql_src",
+    } <= input_targets
+    assert {
+        "pr_xpto.gold.tb_magic_out",
+        "pr_xpto.gold.tb_fstr_out",
+        "pr_xpto.gold.tb_ipynb_merge",
+        "pr_xpto.gold.tb_sql_dst",
+    } <= output_targets
+
+
+# --------------------------------------------------------------------------- #
+# 6. Segurança (zero execução) e controle de falsos positivos
+# --------------------------------------------------------------------------- #
+
+
+def test_never_executes_user_code_and_avoids_false_positives(tmp_path: Path) -> None:
+    sentinel = tmp_path / "NUNCA_CRIAR.txt"
+    _write(
+        tmp_path,
+        "perigoso.py",
+        f"""
+        import logging
+        from pyspark.sql.functions import col
+
+        Path({str(sentinel)!r}).write_text("side-effect")
+        raise RuntimeError("Este código jamais deve ser executado")
+
+        logger = logging.getLogger("app.core.service")
+        url = "https://api.banco.com/v1/bancos"
+        versao = "1.2.3"
+        df = conector.read.table("pr_xpto.xpto_ing.tb_segura")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="perigoso.py")
+
+    assert not sentinel.exists()
+    assert "pr_xpto.xpto_ing.tb_segura" in {e.target for e in res.inputs}
+    unclassified_targets = {r.target for r in res.unclassified_table_refs}
+    assert "app.core.service" not in unclassified_targets
+    assert "1.2.3" not in unclassified_targets
+    assert "https://api.banco.com/v1/bancos" not in unclassified_targets
+
+
+# --------------------------------------------------------------------------- #
+# 7. CLI JSON
+# --------------------------------------------------------------------------- #
+
+
+def test_cli_outputs_valid_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    _write(tmp_path, "job.py", 'df = conector.read.table(f"{env}_xpto.xpto_ing.tb_cli")\n')
+
+    code = cli_main(["--path", str(tmp_path), "--entrypoint", "job.py", "--env-prefix", "pr"])
+
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert any(item["target"] == "pr_xpto.xpto_ing.tb_cli" for item in payload["inputs"])
