@@ -149,12 +149,37 @@ def _iter_direct_nodes(fn: ast.FunctionDef) -> list[ast.AST]:
     return out
 
 
+def _str_method_origin(
+    call: ast.Call,
+    lineage: dict[str, ParamOrigin],
+    summaries: dict[str, FuncSummary],
+) -> tuple[bool, ParamOrigin | None]:
+    """Trata chamadas de métodos string (`.strip()`, `.lower()`, `.format()`).
+
+    Args:
+        call: Nó `ast.Call`.
+        lineage: Linhagem atual de variáveis locais.
+        summaries: Resumos conhecidos de funções auxiliares.
+
+    Returns:
+        Tupla `(tratado, origem_propagada)`.
+    """
+    if not isinstance(call.func, ast.Attribute):
+        return False, None
+    if call.func.attr in _STR_PASSTHROUGH_METHODS:
+        return True, _propagate_origin(call.func.value, lineage, summaries)
+    if call.func.attr == "format":
+        parts: list[ast.expr] = [call.func.value, *call.args, *(kw.value for kw in call.keywords)]
+        return True, _unique_origin(parts, lineage, summaries)
+    return False, None
+
+
 def _call_origin(
     call: ast.Call,
     lineage: dict[str, ParamOrigin],
     summaries: dict[str, FuncSummary],
 ) -> ParamOrigin | None:
-    """Resolve se uma chamada propaga um parâmetro (`.strip()`, pass-through ou validador 1-arg).
+    """Resolve se uma chamada propaga um parâmetro (`.strip()`, `.format()`, pass-through ou 1-arg).
 
     Args:
         call: Nó `ast.Call`.
@@ -164,8 +189,9 @@ def _call_origin(
     Returns:
         `ParamOrigin` propagado ou `None`.
     """
-    if isinstance(call.func, ast.Attribute) and call.func.attr in _STR_PASSTHROUGH_METHODS:
-        return _propagate_origin(call.func.value, lineage, summaries)
+    handled, str_origin = _str_method_origin(call, lineage, summaries)
+    if handled:
+        return str_origin
 
     callee = _extract_callee_name(call)
     summary = summaries.get(callee) if callee else None

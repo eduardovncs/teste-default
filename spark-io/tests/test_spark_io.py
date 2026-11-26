@@ -683,3 +683,61 @@ def test_safety_net_never_silently_drops_exotic_spark_read_or_write(tmp_path: Pa
     unresolved_lines = {u.line for u in res.unresolved_dynamic}
     assert {1, 2, 3} <= unresolved_lines
     assert all(u.kind == "read" for u in res.unresolved_dynamic if u.line in {1, 2, 3})
+
+
+def test_wrapper_with_format_and_fstring_save_as_table(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "save_wrapper.py",
+        """
+        def save_into_hdfs_as_text(spark, df, table_name):
+            df.write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+                f"{table_name}".format(table_name=table_name)
+            )
+
+        def save_with_plain_format(df, table_name):
+            df.write.mode("append").saveAsTable("{table_name}".format(table_name=table_name))
+
+        def main(spark, df):
+            save_into_hdfs_as_text(spark, df, "pr_adqemp.aabr_wks.book_consignado_delta")
+            save_with_plain_format(df, "pr_adqemp.aabr_wks.book_consignado_hist")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="save_wrapper.py", env_prefix="pr")
+
+    out_by_target = {e.target: e for e in res.outputs}
+    assert set(out_by_target) == {
+        "pr_adqemp.aabr_wks.book_consignado_delta",
+        "pr_adqemp.aabr_wks.book_consignado_hist",
+    }
+    first = out_by_target["pr_adqemp.aabr_wks.book_consignado_delta"]
+    assert first.via == "wrapper:save_into_hdfs_as_text"
+    assert first.mode == "overwrite"
+    assert first.data_format == "delta"
+    assert first.options.get("overwriteSchema") == "true"
+    assert res.unresolved_dynamic == []
+
+
+def test_sql_drop_truncate_alter_optimize_are_not_recorded_as_inputs(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "ddl_job.py",
+        """
+        conector.sql("DROP TABLE IF EXISTS pr_xpto.gold.tb_antiga")
+        conector.sql("DROP VIEW IF EXISTS vw_lixo")
+        conector.sql("TRUNCATE TABLE pr_xpto.gold.tb_truncada")
+        conector.sql("ALTER TABLE pr_xpto.gold.tb_alterada ADD COLUMNS (cbco_st STRING)")
+        conector.sql("OPTIMIZE pr_xpto.gold.tb_otimizada ZORDER BY (cbco)")
+        conector.sql("VACUUM pr_xpto.gold.tb_vacuum RETAIN 168 HOURS")
+        conector.sql("DESCRIBE TABLE pr_xpto.gold.tb_desc")
+        conector.sql("CACHE TABLE vw_cache AS SELECT * FROM pr_xpto.xpto_ing.tb_real_src")
+        conector.sql("INSERT INTO pr_xpto.gold.tb_real_dst SELECT * FROM vw_cache")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="ddl_job.py", env_prefix="pr")
+
+    assert {e.target for e in res.inputs} == {"pr_xpto.xpto_ing.tb_real_src"}
+    assert {e.target for e in res.outputs} == {"pr_xpto.gold.tb_real_dst"}
+    assert res.unresolved_dynamic == []

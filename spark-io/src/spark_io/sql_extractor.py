@@ -17,6 +17,15 @@ _DML_ACTIONS: tuple[tuple[type[exp.Expr], str], ...] = (
     (exp.Update, "sql:UPDATE"),
     (exp.Delete, "sql:DELETE"),
 )
+_DATA_FLOW_STMTS: tuple[type[exp.Expr], ...] = (
+    exp.Query,
+    exp.Insert,
+    exp.Merge,
+    exp.Update,
+    exp.Delete,
+    exp.Create,
+    exp.Cache,
+)
 
 
 @dataclass(frozen=True)
@@ -168,6 +177,32 @@ def _record_read_tables(
             result.hits.append(SqlTableHit(table=name, kind="read", via="sql:SELECT", dynamic=is_dyn))
 
 
+def _handle_cache_statement(
+    stmt: exp.Cache,
+    env_prefix: str,
+    known_temp_views: set[str],
+    result: SqlExtractionResult,
+) -> None:
+    """Trata `CACHE TABLE v AS SELECT ...` registrando `v` como temp view e extraindo leituras.
+
+    Args:
+        stmt: Nó `exp.Cache` do `sqlglot`.
+        env_prefix: Prefixo padrão de ambiente (`pr`).
+        known_temp_views: Conjunto mutável de temp views conhecidas.
+        result: Acumulador de saída.
+    """
+    if stmt.expression is None:
+        return
+    cache_target = _unwrap_table(stmt.this)
+    if cache_target is not None:
+        view_name, _ = _format_table_name(cache_target, env_prefix)
+        if view_name:
+            known_temp_views.add(view_name.lower())
+            result.created_temp_views.add(view_name.lower())
+    cte_names = {cte.alias_or_name.lower() for cte in stmt.expression.find_all(exp.CTE) if cte.alias_or_name}
+    _record_read_tables(stmt.expression, None, env_prefix, cte_names | known_temp_views, result)
+
+
 def _collect_statement_hits(
     stmt: exp.Expr,
     env_prefix: str,
@@ -182,6 +217,11 @@ def _collect_statement_hits(
         known_temp_views: Conjunto (minúsculo) de temp views conhecidas até este ponto.
         result: Acumulador de saída.
     """
+    if not isinstance(stmt, _DATA_FLOW_STMTS):
+        return
+    if isinstance(stmt, exp.Cache):
+        _handle_cache_statement(stmt, env_prefix, known_temp_views, result)
+        return
     cte_names = {cte.alias_or_name.lower() for cte in stmt.find_all(exp.CTE) if cte.alias_or_name}
     target_node, action, is_temp_view = _extract_write_target(stmt)
     _record_target_table(target_node, action, is_temp_view, env_prefix, known_temp_views, result)
