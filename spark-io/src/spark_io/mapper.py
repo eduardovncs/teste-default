@@ -34,6 +34,7 @@ from spark_io.partial_eval import (
     FuncSummary,
     apply_env_prefix,
     bind_assignment,
+    eval_nested_dict,
     eval_str_expr,
     eval_str_list,
     is_table_pattern,
@@ -100,7 +101,9 @@ class _MapperContext:
     wrappers: dict[str, InternalWrapper] = field(default_factory=dict)
     func_summaries: dict[str, FuncSummary] = field(default_factory=dict)
     visited_files: set[Path] = field(default_factory=set)
-    visited_symbols: set[tuple[Path, str]] = field(default_factory=set)
+    visited_calls: set[tuple[Path, str, tuple[tuple[str, str], ...]]] = field(default_factory=set)
+    local_func_defs: dict[Path, dict[str, ast.FunctionDef | ast.AsyncFunctionDef]] = field(default_factory=dict)
+    called_local_funcs: dict[Path, set[str]] = field(default_factory=dict)
     analyzed_wrappers: set[str] = field(default_factory=set)
     covered_lines: dict[str, set[int]] = field(default_factory=dict)
     seen_io: set[tuple[str, str, str, int]] = field(default_factory=set)
@@ -374,6 +377,9 @@ def _record_sql_block(
     ctx.result.warnings.extend(extracted.warnings)
     for hit in extracted.hits:
         kind: IoKind = "write" if hit.kind == "write" else "read"
+        if hit.table == WILDCARD:
+            _record_unresolved(ctx, UnresolvedDynamic(file=rel_file, line=line, call=hit.via, kind=kind, expr=sql))
+            continue
         _record_io(
             ctx,
             IoEntry(
@@ -682,13 +688,132 @@ def _resolve_imported_target(call: ast.Call, env: EnvScope) -> tuple[str, str] |
     return None
 
 
-def _analyze_imported_symbol(ctx: _MapperContext, mod_name: str, sym_name: str) -> bool:
+def _bind_arg_value(param_name: str, arg_node: ast.expr, caller_env: EnvScope, callee_env: EnvScope) -> str:
+    """Avalia um argumento no escopo chamador e vincula ao parâmetro no escopo chamado.
+
+    Args:
+        param_name: Nome do parâmetro na função chamada.
+        arg_node: Expressão AST passada na chamada.
+        caller_env: Escopo simbólico do chamador.
+        callee_env: Escopo simbólico da função chamada.
+
+    Returns:
+        Representação resumida em string para compor a assinatura da chamada.
+    """
+    nested = eval_nested_dict(arg_node, caller_env)
+    if nested is not None:
+        callee_env.dicts[param_name] = nested
+        return "<dict>"
+    list_val = eval_str_list(arg_node, caller_env)
+    if list_val is not None:
+        callee_env.lists[param_name] = list_val
+        return ",".join(list_val)
+    str_val = eval_str_expr(arg_node, caller_env)
+    callee_env.strings[param_name] = str_val
+    return str_val
+
+
+def _bind_default_args(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    callee_env: EnvScope,
+    sig: dict[str, str],
+) -> None:
+    """Vincula defaults literais de string de uma função ao escopo do callee.
+
+    Args:
+        fn: Definição da função chamada.
+        callee_env: Escopo simbólico da função chamada.
+        sig: Dicionário acumulador da assinatura da chamada.
+    """
+    offset = len(fn.args.args) - len(fn.args.defaults)
+    for idx, default_node in enumerate(fn.args.defaults):
+        if isinstance(default_node, ast.Constant) and isinstance(default_node.value, str):
+            p_name = fn.args.args[offset + idx].arg
+            callee_env.strings[p_name] = default_node.value
+            sig[p_name] = default_node.value
+
+
+def _bind_call_arguments(
+    fn: ast.FunctionDef | ast.AsyncFunctionDef,
+    call: ast.Call,
+    caller_env: EnvScope,
+    callee_env: EnvScope,
+) -> tuple[tuple[str, str], ...]:
+    """Vincula defaults, argumentos posicionais e nomeados da chamada ao escopo do callee.
+
+    Args:
+        fn: Definição da função chamada.
+        call: Nó `ast.Call` no ponto da chamada.
+        caller_env: Escopo simbólico do chamador.
+        callee_env: Escopo simbólico da função chamada.
+
+    Returns:
+        Tupla ordenada `(param, resumo)` identificando esta invocação.
+    """
+    params = [a.arg for a in fn.args.args]
+    if params and params[0] in ("self", "cls"):
+        params = params[1:]
+
+    sig: dict[str, str] = {}
+    _bind_default_args(fn, callee_env, sig)
+
+    for idx, arg_node in enumerate(call.args):
+        if idx < len(params):
+            sig[params[idx]] = _bind_arg_value(params[idx], arg_node, caller_env, callee_env)
+
+    for kw in call.keywords:
+        if kw.arg:
+            sig[kw.arg] = _bind_arg_value(kw.arg, kw.value, caller_env, callee_env)
+
+    return tuple(sorted(sig.items()))
+
+
+def _execute_symbol_body(
+    ctx: _MapperContext,
+    mod_path: Path,
+    target_node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
+    call: ast.Call,
+    callee_env: EnvScope,
+    caller_env: EnvScope,
+) -> None:
+    """Percorre o corpo de uma função ou classe chamada vinculando argumentos com guarda de ciclo.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        mod_path: Arquivo onde o símbolo está definido.
+        target_node: Definição AST da função ou classe.
+        call: Chamada AST no ponto de invocação.
+        callee_env: Escopo base da função/classe chamada.
+        caller_env: Escopo do chamador para avaliação dos argumentos.
+    """
+    bound_sig: tuple[tuple[str, str], ...] = ()
+    if isinstance(target_node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        bound_sig = _bind_call_arguments(target_node, call, caller_env, callee_env)
+
+    key = (mod_path, target_node.name, bound_sig)
+    if key in ctx.visited_calls:
+        return
+    ctx.visited_calls.add(key)
+    temp_views: set[str] = set()
+    _walk_statements(ctx, target_node.body, mod_path, callee_env, temp_views)
+    _run_safety_audit(ctx, target_node, _rel_str(ctx.project_root, mod_path))
+
+
+def _analyze_imported_symbol(
+    ctx: _MapperContext,
+    mod_name: str,
+    sym_name: str,
+    call: ast.Call,
+    caller_env: EnvScope,
+) -> bool:
     """Analisa estaticamente apenas a função ou classe importada de um módulo local.
 
     Args:
         ctx: Contexto compartilhado do mapeador.
         mod_name: Nome pontuado do módulo local.
         sym_name: Nome da função ou classe invocada.
+        call: Nó `ast.Call` no ponto da chamada.
+        caller_env: Escopo simbólico do chamador.
 
     Returns:
         `True` quando o símbolo local foi encontrado e processado.
@@ -696,9 +821,6 @@ def _analyze_imported_symbol(ctx: _MapperContext, mod_name: str, sym_name: str) 
     mod_path = _resolve_import_module(ctx.project_root, mod_name)
     if mod_path is None:
         return False
-    key = (mod_path, sym_name)
-    if key in ctx.visited_symbols:
-        return True
     _, tree = _load_and_parse(ctx, mod_path)
     if tree is None:
         return False
@@ -714,12 +836,35 @@ def _analyze_imported_symbol(ctx: _MapperContext, mod_name: str, sym_name: str) 
     if target_node is None:
         return False
 
-    ctx.visited_symbols.add(key)
-    mod_env = _collect_module_env(ctx, tree)
-    temp_views: set[str] = set()
-    _walk_statements(ctx, target_node.body, mod_path, mod_env, temp_views)
-    rel_mod = _rel_str(ctx.project_root, mod_path)
-    _run_safety_audit(ctx, target_node, rel_mod)
+    _execute_symbol_body(ctx, mod_path, target_node, call, _collect_module_env(ctx, tree), caller_env)
+    return True
+
+
+def _analyze_local_function_call(
+    ctx: _MapperContext,
+    cur_file: Path,
+    callee: str,
+    call: ast.Call,
+    caller_env: EnvScope,
+) -> bool:
+    """Analisa uma função definida no mesmo arquivo vinculando os argumentos passados.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        cur_file: Arquivo atual.
+        callee: Nome simples da função chamada.
+        call: Nó `ast.Call`.
+        caller_env: Escopo simbólico do chamador.
+
+    Returns:
+        `True` quando uma função local elegível foi analisada.
+    """
+    if callee in ctx.func_summaries:
+        return False
+    fn_node = ctx.local_func_defs.get(cur_file.resolve(), {}).get(callee)
+    if fn_node is None:
+        return False
+    _execute_symbol_body(ctx, cur_file.resolve(), fn_node, call, caller_env.copy(), caller_env)
     return True
 
 
@@ -904,7 +1049,10 @@ def _process_single_call(
         return True
 
     imported = _resolve_imported_target(call, env)
-    if imported is not None and _analyze_imported_symbol(ctx, imported[0], imported[1]):
+    if imported is not None and _analyze_imported_symbol(ctx, imported[0], imported[1], call, env):
+        return True
+
+    if callee and _analyze_local_function_call(ctx, cur_file, callee, call, env):
         return True
 
     if callee:
@@ -973,15 +1121,20 @@ def _walk_control_flow(
         temp_views: Conjunto mutável de temp views conhecidas.
     """
     if isinstance(stmt, ast.For):
+        _inspect_expression_calls(ctx, stmt.iter, cur_file, env, temp_views)
         _handle_for_loop(ctx, stmt, cur_file, env, temp_views)
     elif isinstance(stmt, (ast.While, ast.If)):
+        _inspect_expression_calls(ctx, stmt.test, cur_file, env, temp_views)
         _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
         _walk_statements(ctx, stmt.orelse, cur_file, env.copy(), temp_views)
     elif isinstance(stmt, (ast.With, ast.AsyncWith)):
+        for item in stmt.items:
+            _inspect_expression_calls(ctx, item.context_expr, cur_file, env, temp_views)
         _walk_statements(ctx, stmt.body, cur_file, env, temp_views)
     elif isinstance(stmt, ast.Try):
         _walk_try_statement(ctx, stmt, cur_file, env, temp_views)
     elif isinstance(stmt, ast.Match):
+        _inspect_expression_calls(ctx, stmt.subject, cur_file, env, temp_views)
         for case in stmt.cases:
             _walk_statements(ctx, case.body, cur_file, env.copy(), temp_views)
 
@@ -1005,7 +1158,8 @@ def _walk_compound_statement(
     if isinstance(stmt, ast.ClassDef):
         _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
     elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        if stmt.name not in ctx.wrappers:
+        deferred = ctx.called_local_funcs.get(cur_file.resolve(), set())
+        if stmt.name not in ctx.wrappers and stmt.name not in deferred:
             _walk_statements(ctx, stmt.body, cur_file, env.copy(), temp_views)
     else:
         _walk_control_flow(ctx, stmt, cur_file, env, temp_views)
@@ -1203,6 +1357,26 @@ def _run_safety_audit(ctx: _MapperContext, node: ast.AST, rel_file: str) -> None
         _record_unresolved(ctx, missed)
 
 
+def _index_local_functions(ctx: _MapperContext, resolved: Path, tree: ast.Module) -> None:
+    """Indexa funções definidas em `tree` e marca as parametrizadas chamadas localmente.
+
+    Args:
+        ctx: Contexto compartilhado do mapeador.
+        resolved: Caminho absoluto do arquivo.
+        tree: AST do módulo.
+    """
+    defs: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {
+        stmt.name: stmt for stmt in tree.body if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    ctx.local_func_defs[resolved] = defs
+    called_names = {
+        node.func.id for node in ast.walk(tree) if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+    }
+    ctx.called_local_funcs[resolved] = {
+        name for name, fn in defs.items() if name in called_names and bool(fn.args.args)
+    }
+
+
 def _analyze_file(ctx: _MapperContext, file_path: Path, env: EnvScope, temp_views: set[str]) -> None:
     """Analisa estaticamente um único arquivo (Camada 1 + Camada 2 + blocos SQL).
 
@@ -1222,6 +1396,7 @@ def _analyze_file(ctx: _MapperContext, file_path: Path, env: EnvScope, temp_view
     _process_run_directives(ctx, doc, resolved, env, temp_views)
 
     if tree is not None:
+        _index_local_functions(ctx, resolved, tree)
         _walk_statements(ctx, tree.body, resolved, env, temp_views)
         _run_safety_audit(ctx, tree, rel_file)
 

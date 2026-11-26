@@ -741,3 +741,73 @@ def test_sql_drop_truncate_alter_optimize_are_not_recorded_as_inputs(tmp_path: P
     assert {e.target for e in res.inputs} == {"pr_xpto.xpto_ing.tb_real_src"}
     assert {e.target for e in res.outputs} == {"pr_xpto.gold.tb_real_dst"}
     assert res.unresolved_dynamic == []
+
+
+def test_captures_sql_helper_called_inside_if_condition_with_bound_args(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "functions.py",
+        """
+        def check_if_table_exists(spark, table):
+            return spark.sql(
+                "select exists (select 1 from {table_of_book} limit 1)".format(table_of_book=table)
+            ).collect()
+        """,
+    )
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        from functions import check_if_table_exists
+
+        book_table = "pr_x.xpto_ing.x"
+        other_table = "pr_x.xpto_ing.y"
+
+        def main(spark):
+            if check_if_table_exists(spark, book_table):
+                pass
+            if check_if_table_exists(spark, other_table):
+                pass
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    assert {e.target for e in res.inputs} == {"pr_x.xpto_ing.x", "pr_x.xpto_ing.y"}
+    assert res.unresolved_dynamic == []
+
+
+def test_binds_multiple_arguments_for_local_and_imported_helpers(tmp_path: Path) -> None:
+    _write(
+        tmp_path,
+        "helpers.py",
+        """
+        def copiar_camada(spark, schema, src_tbl, dst_tbl):
+            spark.sql(f"INSERT INTO pr_x.{schema}.{dst_tbl} SELECT * FROM pr_x.{schema}.{src_tbl}")
+        """,
+    )
+    _write(
+        tmp_path,
+        "job.py",
+        """
+        from helpers import copiar_camada
+
+        def ler_local(schema, tbl):
+            return conector.read.table(f"{env}_xpto.{schema}.{tbl}")
+
+        def main(spark):
+            if spark.sql("SELECT COUNT(*) FROM pr_x.xpto_ing.tb_cond").collect():
+                df = ler_local("xpto_ing", "tb_local")
+                copiar_camada(spark, "xpto_ing", "tb_a", "tb_b")
+        """,
+    )
+
+    res = map_spark_io(tmp_path, entrypoint="job.py", env_prefix="pr")
+
+    assert {e.target for e in res.inputs} == {
+        "pr_x.xpto_ing.tb_cond",
+        "pr_xpto.xpto_ing.tb_local",
+        "pr_x.xpto_ing.tb_a",
+    }
+    assert {e.target for e in res.outputs} == {"pr_x.xpto_ing.tb_b"}
+    assert res.unresolved_dynamic == []
